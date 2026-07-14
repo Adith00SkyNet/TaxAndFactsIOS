@@ -183,6 +183,11 @@ private enum AppConfiguration {
 }
 
 private struct HomeTabContainer: View {
+    private enum W2ScanSource {
+        case camera
+        case photoLibrary
+    }
+
     let manager: ReadLaterManager
     @Binding var url: URL
     @Binding var isOffline: Bool
@@ -194,7 +199,7 @@ private struct HomeTabContainer: View {
     @State private var currentHTMLString = ""
     @State private var currentImageURLString = ""
     @State private var captureManager = CalculatorCaptureManager()
-    @State private var pendingW2Fields: W2ExtractedFields?
+    @State private var pendingW2Documents: [W2ExtractedFields] = []
     @State private var w2PopulateRequestID = 0
     @State private var isShowingCamera = false
     @State private var isShowingPhotoLibrary = false
@@ -202,6 +207,8 @@ private struct HomeTabContainer: View {
     @State private var isRecognizingText = false
     @State private var isCalculatorStep2 = false
     @State private var captureAlert: CalculatorCaptureAlert?
+    @State private var lastW2ScanSource: W2ScanSource = .camera
+    @State private var shouldPopulateQueuedW2Documents = false
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -219,8 +226,9 @@ private struct HomeTabContainer: View {
                     currentURLString: $currentURLString,
                     currentHTMLString: $currentHTMLString,
                     currentImageURLString: $currentImageURLString,
-                    pendingW2Fields: $pendingW2Fields,
+                    pendingW2Documents: $pendingW2Documents,
                     w2PopulateRequestID: $w2PopulateRequestID,
+                    shouldPopulateQueuedW2Documents: $shouldPopulateQueuedW2Documents,
                     canGoBack: $canGoBack,
                     backRequestID: $backRequestID,
                     isCalculatorStep2: $isCalculatorStep2,
@@ -247,11 +255,15 @@ private struct HomeTabContainer: View {
             }
         }
         .sheet(isPresented: $isShowingCamera) {
-            CameraCaptureView(onImageCaptured: processCapturedImage)
+            CameraCaptureView { image in
+                processCapturedImage(image, source: .camera)
+            }
                 .ignoresSafeArea()
         }
         .sheet(isPresented: $isShowingPhotoLibrary) {
-            PhotoLibraryCaptureView(onImageCaptured: processCapturedImage)
+            PhotoLibraryCaptureView { image in
+                processCapturedImage(image, source: .photoLibrary)
+            }
         }
         .confirmationDialog("Scan W-2", isPresented: $isShowingCaptureOptions, titleVisibility: .visible) {
             Button {
@@ -267,11 +279,21 @@ private struct HomeTabContainer: View {
             }
         }
         .alert(item: $captureAlert) { alert in
-            Alert(
-                title: Text(alert.title),
-                message: Text(alert.message),
-                dismissButton: .default(Text("OK"))
-            )
+            switch alert.kind {
+            case .info:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    dismissButton: .default(Text("OK"))
+                )
+            case .scanDecision:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Yes"), action: reopenLastScanSource),
+                    secondaryButton: .cancel(Text("Done Scanning"), action: beginW2Population)
+                )
+            }
         }
     }
 
@@ -296,22 +318,35 @@ private struct HomeTabContainer: View {
         guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
             captureAlert = CalculatorCaptureAlert(
                 title: "Camera Unavailable",
-                message: "This device does not have an available camera."
+                message: "This device does not have an available camera.",
+                kind: .info
             )
             return
         }
 
+        lastW2ScanSource = .camera
         isShowingCamera = true
     }
 
     private func openPhotoLibrary() {
+        lastW2ScanSource = .photoLibrary
         isShowingPhotoLibrary = true
     }
 
-    private func processCapturedImage(_ image: UIImage) {
+    private func reopenLastScanSource() {
+        switch lastW2ScanSource {
+        case .camera:
+            openCamera()
+        case .photoLibrary:
+            openPhotoLibrary()
+        }
+    }
+
+    private func processCapturedImage(_ image: UIImage, source: W2ScanSource) {
         isShowingCamera = false
         isShowingPhotoLibrary = false
         isRecognizingText = true
+        lastW2ScanSource = source
 
         Task {
             let recognizedItems = await TextRecognizer.recognizeTextItems(in: image)
@@ -323,26 +358,43 @@ private struct HomeTabContainer: View {
             let captureText = extractedFields.summaryText
 
             await MainActor.run {
+                print("[TaxAndFacts] W2 extracted values: \(extractedFields.summaryText.replacingOccurrences(of: "\n", with: " | "))")
+
                 if extractedFields.hasAnyValue {
                     captureManager.saveCapture(
                         pageTitle: currentTitle,
                         urlString: currentURLString,
                         recognizedText: captureText
                     )
+                    print("[TaxAndFacts] W2 saved capture debug: socialSecurityTips=\(extractedFields.socialSecurityTips ?? "nil") allocatedTips=\(extractedFields.allocatedTips ?? "nil")")
+
+                    pendingW2Documents.append(extractedFields)
 
                     if AppConfiguration.isCalculatorURL(currentURLString), isCalculatorStep2 {
-                        pendingW2Fields = extractedFields
-                        w2PopulateRequestID += 1
+                        captureAlert = CalculatorCaptureAlert.scanDecision(
+                            documentNumber: pendingW2Documents.count
+                        )
+                    } else {
+                        beginW2Population()
                     }
+                } else {
+                    captureAlert = CalculatorCaptureAlert(
+                        title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
+                        message: captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields),
+                        kind: .info
+                    )
                 }
 
                 isRecognizingText = false
-                captureAlert = CalculatorCaptureAlert(
-                    title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
-                    message: captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields)
-                )
             }
         }
+    }
+
+    private func beginW2Population() {
+        guard !pendingW2Documents.isEmpty else { return }
+
+        shouldPopulateQueuedW2Documents = true
+        w2PopulateRequestID += 1
     }
 
     private func captureAlertTitle(recognizedText: String, extractedFields: W2ExtractedFields) -> String {
@@ -382,8 +434,9 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
     @Binding var currentURLString: String
     @Binding var currentHTMLString: String
     @Binding var currentImageURLString: String
-    @Binding var pendingW2Fields: W2ExtractedFields?
+    @Binding var pendingW2Documents: [W2ExtractedFields]
     @Binding var w2PopulateRequestID: Int
+    @Binding var shouldPopulateQueuedW2Documents: Bool
     @Binding var canGoBack: Bool
     @Binding var backRequestID: Int
     @Binding var isCalculatorStep2: Bool
@@ -393,6 +446,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorStepMessageName)
+        configuration.userContentController.add(context.coordinator, name: Coordinator.w2DebugMessageName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -437,11 +491,13 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         static let calculatorStepMessageName = "calculatorStep"
+        static let w2DebugMessageName = "taxFactsDebug"
 
         var parent: NativeWebViewWrapper
         var loadedURL: URL?
         var handledBackRequestID = 0
         var handledW2PopulateRequestID = -1
+        var submittedW2PopulateRequestID = -1
         var w2PrefillRetryTimer: Timer?
         var w2PrefillRetryCount = 0
         let w2PrefillRetryLimit = 10
@@ -503,6 +559,10 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         self?.parent.isCalculatorStep2 = isStep2
                     }
                 }
+                return
+            }
+
+            if message.name == Self.w2DebugMessageName {
                 return
             }
         }
@@ -787,6 +847,18 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     return results;
                 }
 
+                function logDebug() {
+                    try {
+                        var parts = Array.prototype.slice.call(arguments).map(function(part) {
+                            return String(part);
+                        });
+                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
+                            window.webkit.messageHandlers.taxFactsDebug.postMessage(parts.join(' '));
+                        }
+                    } catch (error) {
+                    }
+                }
+
                 function fieldDefinitions() {
                     return [
                         {
@@ -988,6 +1060,15 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
                 function getAngularScope() {
                     if (!window.angular) {
+                        var matches = queryAllAcrossDocuments('[ng-model="' + definition.ngModelPath + '"]');
+                        if (matches && matches.length > 0) {
+                            if (index >= 0 && index < matches.length) {
+                                return matches[index];
+                            }
+
+                            return matches[0];
+                        }
+
                         return null;
                     }
 
@@ -1068,13 +1149,26 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     return null;
                 }
 
-                function setAngularModelValue(definition, value) {
+                function setAngularModelValue(definition, value, targetElement) {
                     if (!definition || !definition.ngModelPath) {
                         return false;
                     }
 
-                    var targetCandidates = queryAllAcrossDocuments('[ng-model="' + definition.ngModelPath + '"]');
-                    if (!targetCandidates || targetCandidates.length === 0) {
+                    var targetCandidates = [];
+                    if (targetElement) {
+                        targetCandidates.push(targetElement);
+                    }
+
+                    var fallbackCandidates = queryAllAcrossDocuments('[ng-model="' + definition.ngModelPath + '"]');
+                    if (fallbackCandidates && fallbackCandidates.length > 0) {
+                        for (var f = 0; f < fallbackCandidates.length; f += 1) {
+                            if (targetCandidates.indexOf(fallbackCandidates[f]) === -1) {
+                                targetCandidates.push(fallbackCandidates[f]);
+                            }
+                        }
+                    }
+
+                    if (targetCandidates.length === 0) {
                         logDebug('W2 debug', definition.key, 'selector', definition.ngModelPath, 'candidates', '0');
                         return false;
                     }
@@ -1086,7 +1180,17 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         }
                     }
 
-                    var orderedCandidates = visibleCandidates.length > 0 ? visibleCandidates : targetCandidates;
+                    var orderedCandidates = [];
+                    if (targetElement) {
+                        orderedCandidates.push(targetElement);
+                    }
+
+                    var candidatePool = visibleCandidates.length > 0 ? visibleCandidates : targetCandidates;
+                    for (var p = 0; p < candidatePool.length; p += 1) {
+                        if (orderedCandidates.indexOf(candidatePool[p]) === -1) {
+                            orderedCandidates.push(candidatePool[p]);
+                        }
+                    }
                     logDebug(
                         'W2 debug',
                         definition.key,
@@ -1097,7 +1201,9 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         'visible',
                         String(visibleCandidates.length),
                         'usingVisible',
-                        String(visibleCandidates.length > 0)
+                        String(visibleCandidates.length > 0),
+                        'targetPreferred',
+                        String(!!targetElement)
                     );
 
                     for (var i = 0; i < orderedCandidates.length; i += 1) {
@@ -1374,6 +1480,20 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 }
 
                 function targetCandidateForDefinition(definition) {
+                    var targetIndex = currentDocumentIndex();
+                    var targetRow = rowContainerForDocumentIndex(targetIndex);
+                    if (targetRow) {
+                        var rowMatch = targetCandidateWithinRow(targetRow, definition);
+                        if (rowMatch) {
+                            return rowMatch;
+                        }
+                    }
+
+                    var candidates = candidatesForDefinition(definition);
+                    if (candidates.length > targetIndex) {
+                        return candidates[targetIndex];
+                    }
+
                     var bestMatch = bestCandidateForDefinition(definition);
                     if (bestMatch) {
                         return bestMatch;
@@ -1424,50 +1544,94 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 function fillField(definition, value) {
                     if (!value) { return true; }
 
-                    reportFieldState(definition, 'before');
-                    var modelApplied = setAngularModelValue(definition, value);
+                    logDebug('W2 fillField begin', definition.key, 'value=' + value, 'docIndex=' + String(currentDocumentIndex()));
+                    var targetRow = rowContainerForDocumentIndex(currentDocumentIndex());
+                    var rowCandidate = targetRow ? targetCandidateWithinRow(targetRow, definition) : null;
                     var bestMatch = targetCandidateForDefinition(definition);
-
-                    var domApplied = false;
-                    if (bestMatch) {
-                        logDebug('W2 fill target', definition.key, 'value', value, 'label', candidateText(bestMatch), 'context', getElementContext(bestMatch));
-
-                        if (bestMatch.isContentEditable) {
-                            domApplied = setEditableValue(bestMatch, value);
-                        } else {
-                            domApplied = setInputValue(bestMatch, value);
-                        }
-                    } else {
-                        logDebug('W2 fill target not found for', definition.key, 'value', value);
+                    if (!bestMatch && rowCandidate) {
+                        bestMatch = rowCandidate;
+                    }
+                    if (!bestMatch) {
+                        bestMatch = exactModelCandidate(definition);
                     }
 
-                    var success = modelApplied || domApplied;
-                    reportFieldState(definition, success ? 'after' : 'failed');
-                    return success;
+                    if (!bestMatch) {
+                        logDebug('W2 fill target not found for', definition.key, 'value', value);
+                        return false;
+                    }
+
+                    logDebug('W2 fill target', definition.key, 'value', value, 'label', candidateText(bestMatch), 'context', getElementContext(bestMatch));
+
+                    logDebug('W2 fillField resolved', definition.key, 'rowCandidate=' + String(!!rowCandidate), 'targetRow=' + String(!!targetRow));
+
+                        var modelApplied = setAngularModelValue(definition, value, bestMatch);
+                        var domApplied = false;
+                        if (bestMatch.isContentEditable) {
+                            domApplied = setEditableValue(bestMatch, value);
+                    } else {
+                        domApplied = setInputValue(bestMatch, value);
+                    }
+
+                    if (!modelApplied) {
+                        modelApplied = setAngularModelValue(definition, value, bestMatch);
+                    }
+
+                    logDebug('W2 field applied', definition.key, 'model=' + String(modelApplied), 'dom=' + String(domApplied), 'value=' + value);
+                    return modelApplied || domApplied || !!bestMatch;
+                }
+
+                function normalizePayloads(payload) {
+                    if (!payload) { return []; }
+                    if (Array.isArray(payload)) {
+                        return payload.filter(function(item) {
+                            return item && Object.keys(item).length > 0;
+                        });
+                    }
+
+                    return Object.keys(payload).length > 0 ? [payload] : [];
                 }
 
                 function createState(payload) {
                     return {
-                        payload: payload || {},
+                        payloads: normalizePayloads(payload),
+                        payloadSignature: payloadSignature(payload),
+                        documentIndex: 0,
                         nextIndex: 0,
-                        lastAttemptAt: 0
+                        lastAttemptAt: 0,
+                        awaitingAnotherW2: false,
+                        addAnotherRequestedForDocIndex: -1,
+                        bootstrappedAdditionalRows: false
                     };
                 }
 
-                function isStateComplete(state) {
-                    var definitions = fieldDefinitions();
-                    for (var i = state.nextIndex; i < definitions.length; i += 1) {
-                        var key = definitions[i].key;
-                        if ((state.payload[key] || '').trim()) {
-                            return false;
+                function payloadSignature(payload) {
+                    var normalizedPayloads = normalizePayloads(payload);
+                    var normalized = [];
+
+                    for (var i = 0; i < normalizedPayloads.length; i += 1) {
+                        var entry = normalizedPayloads[i] || {};
+                        var keys = Object.keys(entry).sort();
+                        var snapshot = {};
+
+                        for (var k = 0; k < keys.length; k += 1) {
+                            snapshot[keys[k]] = String(entry[keys[k]]);
                         }
+
+                        normalized.push(snapshot);
                     }
 
-                    return true;
+                    return JSON.stringify(normalized);
                 }
 
-                function clickAdvanceControl() {
+                function isStateComplete(state) {
+                    return !state || !state.payloads || state.documentIndex >= state.payloads.length;
+                }
+
+                function clickAddAnotherW2() {
                     var controlSelectors = [
+                        'button[ng-click="anotherWage()"]',
+                        'button[data-ng-click="anotherWage()"]',
+                        'button.clone-btn[ng-click="anotherWage()"]',
                         'button',
                         '[role=\"button\"]',
                         'a',
@@ -1476,7 +1640,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     ];
 
                     var controls = queryAllAcrossDocuments(controlSelectors.join(','));
-                    var advanceLabels = ['next', 'continue', 'done', 'submit', 'save', 'finish'];
+                    var advanceLabels = ['add another w2', 'add another', 'another w2'];
 
                     for (var i = 0; i < controls.length; i += 1) {
                         var control = controls[i];
@@ -1484,54 +1648,238 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                             continue;
                         }
 
-                        var text = normalize(elementText(control));
+                        var text = normalize(candidateText(control) + ' ' + elementText(control));
                         for (var j = 0; j < advanceLabels.length; j += 1) {
-                            if (text === advanceLabels[j] || text.indexOf(advanceLabels[j] + ' ') !== -1 || text.indexOf(' ' + advanceLabels[j]) !== -1) {
-                                control.click();
+                            if (text.indexOf(advanceLabels[j]) !== -1) {
+                                try {
+                                    control.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                                    control.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    control.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    control.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                } catch (error) {
+                                    control.click();
+                                }
+
+                                logDebug('W2 add another clicked', String(i), text);
                                 return true;
                             }
                         }
                     }
 
+                    var allElements = queryAllAcrossDocuments('*');
+                    for (var k = 0; k < allElements.length; k += 1) {
+                        var element = allElements[k];
+                        if (!isVisible(element) || element.disabled) {
+                            continue;
+                        }
+
+                        var elementTextValue = normalize(candidateText(element) + ' ' + elementText(element));
+                        for (var m = 0; m < advanceLabels.length; m += 1) {
+                            if (elementTextValue.indexOf(advanceLabels[m]) !== -1) {
+                                try {
+                                    element.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                                    element.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                                    element.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                                    element.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                                } catch (error) {
+                                    try { element.click(); } catch (clickError) {}
+                                }
+
+                                logDebug('W2 add another clicked fallback', String(k), elementTextValue);
+                                return true;
+                            }
+                        }
+                    }
+
+                    logDebug('W2 add another button not found');
                     return false;
+                }
+
+                function w2RowCount() {
+                    return rowContainersForW2().length;
                 }
 
                 function attemptFill() {
                     var state = window.__taxFactsW2PrefillState;
-                    if (!state || !state.payload) { return false; }
+                    if (!state || !state.payloads || state.documentIndex >= state.payloads.length) { return false; }
 
-                    logDebug('W2 attemptFill start', 'nextIndex=' + String(state.nextIndex), 'payloadKeys=' + Object.keys(state.payload).join(','));
+                    function visibleW2Rows() {
+                        return queryAllAcrossDocuments('[ng-repeat="w2 in data.wages"], [data-ng-repeat="w2 in data.wages"]').filter(function(row) {
+                            return isVisible(row);
+                        });
+                    }
+
+                    function rowTargetForDocumentIndex(index) {
+                        var rows = visibleW2Rows();
+                        if (!rows || rows.length === 0) {
+                            return null;
+                        }
+
+                        if (index >= 0 && index < rows.length) {
+                            return rows[index];
+                        }
+
+                        return rows[rows.length - 1];
+                    }
+
+                    function rowTargetForDefinition(row, definition, index) {
+                        var selectors = [
+                            '[ng-model="' + definition.ngModelPath + '"]',
+                            '[data-ng-model="' + definition.ngModelPath + '"]',
+                            '[name="' + definition.modelName + '"]'
+                        ];
+
+                        if (row) {
+                            for (var r = 0; r < selectors.length; r += 1) {
+                                var rowTarget = row.querySelector(selectors[r]);
+                                if (rowTarget) {
+                                    return rowTarget;
+                                }
+                            }
+                        }
+
+                        return null;
+                    }
+
+                    function applyFieldValue(target, definition, value) {
+                        if (!target || !definition || !value) {
+                            return false;
+                        }
+
+                        var modelApplied = false;
+                        try {
+                            modelApplied = setAngularModelValue(definition, value, target);
+                        } catch (error) {
+                            logDebug('W2 model write error', definition.key, String(error));
+                        }
+
+                        var domApplied = false;
+                        try {
+                            if (target.isContentEditable) {
+                                domApplied = setEditableValue(target, value);
+                            } else {
+                                domApplied = setInputValue(target, value);
+                            }
+                        } catch (error) {
+                            logDebug('W2 DOM write error', definition.key, String(error));
+                        }
+
+                        return modelApplied || domApplied;
+                    }
+
+                    if (state.awaitingAnotherW2) {
+                        var existingRows = visibleW2Rows();
+                        if (existingRows.length > state.documentIndex + 1) {
+                            state.documentIndex += 1;
+                            state.nextIndex = 0;
+                            state.awaitingAnotherW2 = false;
+                            state.addAnotherRequestedForDocIndex = -1;
+                        } else {
+                            logDebug('W2 waiting for added row', 'currentDoc=' + String(state.documentIndex), 'rows=' + String(existingRows.length));
+                            if (state.addAnotherRequestedForDocIndex !== state.documentIndex) {
+                                state.addAnotherRequestedForDocIndex = state.documentIndex;
+                                clickAddAnotherW2();
+                            } else {
+                                logDebug('W2 add another already requested', 'currentDoc=' + String(state.documentIndex));
+                            }
+                            window.setTimeout(scheduleAttempt, 250);
+                            return false;
+                        }
+                    }
+
+                    var payload = state.payloads[state.documentIndex];
+                    if (!payload) { return false; }
+
+                    logDebug('W2 attemptFill start', 'docIndex=' + String(state.documentIndex), 'nextIndex=' + String(state.nextIndex), 'payloadKeys=' + Object.keys(payload).join(','));
+                    logDebug('W2 payload keys', Object.keys(payload).join(','), JSON.stringify(payload));
+                    logDebug('W2 payload doc snapshot', 'docIndex=' + String(state.documentIndex), JSON.stringify(payload));
+
+                    var orderedKeys = [
+                        'wages',
+                        'federalIncomeTaxWithheld',
+                        'medicareWagesAndTips',
+                        'stateIncomeTaxWithheld',
+                        'socialSecurityTips',
+                        'allocatedTips'
+                    ];
+                    var definitionsByKey = {};
                     var definitions = fieldDefinitions();
-                    logDebug('W2 payload keys', Object.keys(state.payload).join(','), JSON.stringify(state.payload));
-                    while (state.nextIndex < definitions.length) {
-                        var definition = definitions[state.nextIndex];
-                        var value = state.payload[definition.key] || '';
+                    var currentRow = rowTargetForDocumentIndex(state.documentIndex);
+                    var filledCount = 0;
+                    var hasTipValues = !!payload && (
+                        Object.prototype.hasOwnProperty.call(payload, 'socialSecurityTips') ||
+                        Object.prototype.hasOwnProperty.call(payload, 'allocatedTips')
+                    );
 
+                    logDebug('W2 current row', 'docIndex=' + String(state.documentIndex), 'rowCount=' + String(visibleW2Rows().length), 'hasRow=' + String(!!currentRow));
+
+                    if (hasTipValues && currentRow) {
+                        var rowScope = getTargetScope(currentRow);
+                        if (rowScope && rowScope.data) {
+                            rowScope.data.checkTip = true;
+                            if (typeof rowScope.$applyAsync === 'function') {
+                                rowScope.$applyAsync();
+                            } else if (typeof rowScope.$apply === 'function') {
+                                rowScope.$apply();
+                            }
+                            logDebug('W2 tip section enabled', 'docIndex=' + String(state.documentIndex));
+                        }
+                    }
+
+                    for (var d = 0; d < definitions.length; d += 1) {
+                        definitionsByKey[definitions[d].key] = definitions[d];
+                    }
+
+                    for (var i = 0; i < orderedKeys.length; i += 1) {
+                        var key = orderedKeys[i];
+                        var value = String((payload && payload[key]) || '').trim();
                         if (!value) {
-                            state.nextIndex += 1;
                             continue;
                         }
 
-                        if (fillField(definition, value)) {
-                            state.nextIndex += 1;
-
-                            if (definition.key === 'wages') {
-                                window.setTimeout(scheduleAttempt, 250);
-                            }
-
-                            return true;
+                        var definition = definitionsByKey[key];
+                        if (!definition) {
+                            continue;
                         }
 
-                        break;
+                        var target = rowTargetForDefinition(currentRow, definition, state.documentIndex);
+                        if (!target) {
+                            logDebug('W2 target missing', key, 'docIndex=' + String(state.documentIndex));
+                            continue;
+                        }
+
+                        logDebug('W2 target chosen', key, 'docIndex=' + String(state.documentIndex), 'label=' + candidateText(target), 'context=' + getElementContext(target));
+                        var applied = applyFieldValue(target, definition, value);
+                        logDebug('W2 field applied', key, 'applied=' + String(applied), 'value=' + value);
+                        if (applied) {
+                            filledCount += 1;
+                        }
                     }
 
-                    if (state.nextIndex >= definitions.length || isStateComplete(state)) {
+                    if (filledCount === 0) {
+                        window.setTimeout(scheduleAttempt, 250);
+                        return false;
+                    }
+
+                    if (state.documentIndex + 1 < state.payloads.length) {
+                        if (!state.awaitingAnotherW2) {
+                            state.awaitingAnotherW2 = true;
+                            state.addAnotherRequestedForDocIndex = state.documentIndex;
+                            logDebug('W2 auto advance to next W2', 'currentDoc=' + String(state.documentIndex), 'nextDoc=' + String(state.documentIndex + 1));
+                            clickAddAnotherW2();
+                        }
+
+                        window.setTimeout(scheduleAttempt, 250);
+                        return false;
+                    }
+
+                    state.documentIndex += 1;
+                    state.nextIndex = 0;
+                    if (state.documentIndex >= state.payloads.length) {
                         window.clearInterval(window.__taxFactsW2PrefillInterval);
                         window.__taxFactsW2PrefillInterval = null;
-                        return true;
                     }
-
-                    return false;
+                    return true;
                 }
 
                 function scheduleAttempt() {
@@ -1540,11 +1888,22 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 }
 
                 window.__taxFactsSetPendingW2Fill = function(payload) {
-                    logDebug('W2 setPendingFill', 'payloadKeys=' + Object.keys(payload || {}).join(','), JSON.stringify(payload || {}));
+                    var payloadCount = String(Array.isArray(payload) ? payload.length : (payload ? 1 : 0));
+
+                    logDebug('W2 setPendingFill', 'payloadCount=' + payloadCount, JSON.stringify(payload || {}));
+                    window.clearInterval(window.__taxFactsW2PrefillInterval);
+                    window.__taxFactsW2PrefillInterval = null;
+                    window.clearTimeout(window.__taxFactsW2PrefillTimer);
+                    window.__taxFactsW2PrefillTimer = null;
                     window.__taxFactsW2PrefillState = createState(payload || null);
+                    if (window.__taxFactsW2PrefillState.payloads.length > 1 && !window.__taxFactsW2PrefillState.bootstrappedAdditionalRows) {
+                        window.__taxFactsW2PrefillState.bootstrappedAdditionalRows = true;
+                        logDebug('W2 bootstrap multi-doc queue', 'payloadCount=' + String(window.__taxFactsW2PrefillState.payloads.length));
+                    }
                     window.clearInterval(window.__taxFactsW2PrefillInterval);
                     window.__taxFactsW2PrefillInterval = window.setInterval(attemptFill, 350);
                     scheduleAttempt();
+                    return attemptFill();
                 };
 
                 if (!window.__taxFactsW2PrefillObserver) {
@@ -1565,13 +1924,13 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
         func attemptW2FieldPrefill(in webView: WKWebView) {
             guard parent.w2PopulateRequestID != handledW2PopulateRequestID,
-                  let payload = parent.pendingW2Fields,
+                  !parent.pendingW2Documents.isEmpty,
+                  parent.shouldPopulateQueuedW2Documents,
                   AppConfiguration.isCalculatorURL(parent.currentURLString) else {
-                stopW2PrefillRetryLoop()
                 return
             }
 
-            guard let payloadJSON = jsonObjectString(from: w2PayloadDictionary(from: payload)) else {
+            guard let payloadJSON = jsonObjectString(from: w2PayloadArray(from: parent.pendingW2Documents)) else {
                 return
             }
 
@@ -1599,518 +1958,62 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
         }
 
         private func performW2PrefillAttempt(in webView: WKWebView, payloadJSON: String) {
-            let directFillScript = """
+            let requestID = parent.w2PopulateRequestID
+            let shouldSubmitPayload = submittedW2PopulateRequestID != requestID
+            let script = shouldSubmitPayload ? """
             (function(payload) {
                 try {
-                function logDebug() {}
-
-                function normalize(value) {
-                    return (value || '')
-                        .toLowerCase()
-                        .replace(/[^a-z0-9]+/g, ' ')
-                        .replace(/\\s+/g, ' ')
-                        .trim();
-                }
-
-                function normalizeKey(value) {
-                    return normalize(value || '').replace(/\\s+/g, '');
-                }
-
-                function isVisible(element) {
-                    if (!element) { return false; }
-
-                    var style = window.getComputedStyle(element);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
-                        return false;
+                    if (window.__taxFactsSetPendingW2Fill) {
+                        return window.__taxFactsSetPendingW2Fill(payload);
                     }
 
-                    var rects = element.getClientRects();
-                    return rects.length > 0 && rects[0].width > 0 && rects[0].height > 0;
-                }
-
-                function allDocuments(rootDocument) {
-                    var docs = [];
-
-                    function visit(doc) {
-                        if (!doc || docs.indexOf(doc) !== -1) {
-                            return;
-                        }
-
-                        docs.push(doc);
-
-                        var frames = [];
-                        try {
-                            frames = Array.from(doc.querySelectorAll('iframe'));
-                        } catch (error) {
-                            return;
-                        }
-
-                        for (var i = 0; i < frames.length; i += 1) {
-                            try {
-                                var frameDoc = frames[i].contentDocument;
-                                if (frameDoc) {
-                                    visit(frameDoc);
-                                }
-                            } catch (error) {
-                            }
-                        }
-
-                        var elements = [];
-                        try {
-                            elements = Array.from(doc.querySelectorAll('*'));
-                        } catch (error) {
-                            elements = [];
-                        }
-
-                        for (var k = 0; k < elements.length; k += 1) {
-                            var shadowRoot = elements[k].shadowRoot;
-                            if (shadowRoot) {
-                                visit(shadowRoot);
-                            }
-                        }
-                    }
-
-                    visit(rootDocument || document);
-                    return docs;
-                }
-
-                function queryAllAcrossDocuments(selector) {
-                    var results = [];
-                    var docs = allDocuments(document);
-
-                    for (var i = 0; i < docs.length; i += 1) {
-                        try {
-                            results = results.concat(Array.from(docs[i].querySelectorAll(selector)));
-                        } catch (error) {
-                        }
-                    }
-
-                    return results;
-                }
-
-                function candidateText(element) {
-                    if (!element) { return ''; }
-
-                    return normalize([
-                        element.getAttribute('aria-label') || '',
-                        element.getAttribute('placeholder') || '',
-                        element.getAttribute('title') || '',
-                        element.getAttribute('name') || '',
-                        element.getAttribute('id') || '',
-                        element.getAttribute('autocomplete') || '',
-                        element.getAttribute('data-field') || '',
-                        element.getAttribute('data-testid') || '',
-                        element.getAttribute('formcontrolname') || '',
-                        element.getAttribute('formControlName') || '',
-                        element.innerText || '',
-                        element.textContent || ''
-                    ].join(' '));
-                }
-
-                function nativeSetValue(element, value) {
-                    if (!element) { return false; }
-
-                    if (element.isContentEditable) {
-                        element.focus();
-                        element.textContent = value;
-                        element.dispatchEvent(new Event('input', { bubbles: true }));
-                        element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.blur();
-                        return true;
-                    }
-
-                    try {
-                        var inputSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-                        var textAreaSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
-                        if (element.tagName === 'INPUT' && inputSetter && inputSetter.set) {
-                            inputSetter.set.call(element, value);
-                        } else if (element.tagName === 'TEXTAREA' && textAreaSetter && textAreaSetter.set) {
-                            textAreaSetter.set.call(element, value);
-                        } else {
-                            element.value = value;
-                        }
-
-                        element.focus();
-                        element.dispatchEvent(new Event('input', { bubbles: true }));
-                        element.dispatchEvent(new Event('change', { bubbles: true }));
-                        element.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Tab' }));
-                        element.blur();
-                        return true;
-                    } catch (error) {
-                        return false;
-                    }
-                }
-
-                function fieldDefinitions() {
-                    return [
-                        { key: 'wages', modelPath: 'w2.wage', patterns: ['wages tips other compensations', 'wages tips other compensation', 'wages tips and other compensation', 'your income', 'w2 income', 'w2 wages', 'box 1', 'wages'] },
-                        { key: 'federalIncomeTaxWithheld', modelPath: 'w2.federal', patterns: ['federal income tax withheld', 'federal income tax with held', 'federal tax withheld', 'federal tax with held', 'box 2 federal income tax withheld', 'box 2 federal income tax', 'box 2', 'income tax withheld', 'federal withholding'] },
-                        { key: 'medicareWagesAndTips', modelPath: 'w2.medicareWages', patterns: ['medicare wages and tips', 'medicare wages tips', 'medicare wages'] },
-                        { key: 'stateIncomeTaxWithheld', modelPath: 'w2.state', patterns: ['state income tax withheld', 'state income tax with held', 'state income tax', 'state tax withheld', 'state tax', 'state withholding', 'box 17 state income tax withheld', 'box 17 state income tax', '17 state income tax withheld', '17 state income tax'] },
-                        { key: 'socialSecurityTips', modelPath: 'w2.sectip', patterns: ['social security tip', 'social security tips'] },
-                        { key: 'allocatedTips', modelPath: 'w2.allotip', patterns: ['allocated tip', 'allocated tips'] }
-                    ];
-                }
-
-                function exactModelCandidate(definition) {
-                    if (!definition || !definition.modelPath) {
-                        return null;
-                    }
-
-                    var selector = '[ng-model="' + definition.modelPath + '"]';
-                    var candidates = queryAllAcrossDocuments(selector);
-                    if (!candidates || candidates.length === 0) {
-                        return null;
-                    }
-
-                    for (var i = 0; i < candidates.length; i += 1) {
-                        if (isVisible(candidates[i])) {
-                            return candidates[i];
-                        }
-                    }
-
-                    return candidates[0];
-                }
-
-                function assignPath(object, path, value) {
-                    if (!object || !path) {
-                        return false;
-                    }
-
-                    var parts = path.split('.');
-                    var current = object;
-
-                    for (var i = 0; i < parts.length - 1; i += 1) {
-                        if (!current[parts[i]]) {
-                            current[parts[i]] = {};
-                        }
-
-                        current = current[parts[i]];
-                    }
-
-                    current[parts[parts.length - 1]] = value;
-                    return true;
-                }
-
-                function getTargetScope(element) {
-                    if (!window.angular || !element) {
-                        return null;
-                    }
-
-                    var current = element;
-                    while (current && current.nodeType === 1) {
-                        var repeatExpression = current.getAttribute ? (current.getAttribute('ng-repeat') || current.getAttribute('data-ng-repeat') || '') : '';
-                        if (repeatExpression.indexOf('w2 in data.wages') !== -1) {
-                            try {
-                                var repeatScope = window.angular.element(current).scope();
-                                if (repeatScope) {
-                                    return repeatScope;
-                                }
-                            } catch (error) {
-                            }
-                        }
-
-                        current = current.parentElement;
-                    }
-
-                    try {
-                        var jq = window.angular.element(element);
-                        if (jq && typeof jq.scope === 'function') {
-                            var scope = jq.scope();
-                            if (scope) {
-                                return scope;
-                            }
-                        }
-                    } catch (error) {
-                    }
-
-                    try {
-                        var fallbackJq = window.angular.element(element);
-                        if (fallbackJq && typeof fallbackJq.isolateScope === 'function') {
-                            return fallbackJq.isolateScope() || null;
-                        }
-                    } catch (error) {
-                    }
-
-                    return null;
-                }
-
-                function setAngularModelValue(element, definition, value) {
-                    if (!window.angular || !element || !definition) {
-                        return false;
-                    }
-
-                    var didUpdate = false;
-                    var scope = getTargetScope(element);
-
-                    try {
-                        var jq = window.angular.element(element);
-                        var ngModelController = jq && jq.controller ? jq.controller('ngModel') : null;
-                        if (ngModelController && typeof ngModelController.$setViewValue === 'function') {
-                            ngModelController.$setViewValue(value);
-                            if (typeof ngModelController.$render === 'function') {
-                                ngModelController.$render();
-                            }
-                            didUpdate = true;
-                        }
-                    } catch (error) {
-                        logDebug('W2 angular controller write error', definition.key, String(error));
-                    }
-
-                    if (scope) {
-                        try {
-                            if (scope.w2 && typeof scope.w2 === 'object') {
-                                scope.w2[definition.key === 'medicareWagesAndTips' ? 'medicareWages' : definition.key === 'federalIncomeTaxWithheld' ? 'federal' : definition.key === 'stateIncomeTaxWithheld' ? 'state' : definition.key === 'socialSecurityTips' ? 'sectip' : definition.key === 'allocatedTips' ? 'allotip' : 'wage'] = value;
-                            } else {
-                                var modelName = definition.key === 'medicareWagesAndTips' ? 'medicareWages' : definition.key === 'federalIncomeTaxWithheld' ? 'federal' : definition.key === 'stateIncomeTaxWithheld' ? 'state' : definition.key === 'socialSecurityTips' ? 'sectip' : definition.key === 'allocatedTips' ? 'allotip' : 'wage';
-                                assignPath(scope, 'w2.' + modelName, value);
-                            }
-
-                            if (typeof scope.$applyAsync === 'function') {
-                                scope.$applyAsync();
-                            } else if (typeof scope.$apply === 'function') {
-                                scope.$apply();
-                            }
-
-                            didUpdate = true;
-                        } catch (error) {
-                            logDebug('W2 angular scope write error', definition.key, String(error));
-                        }
-                    }
-
-                    return didUpdate;
-                }
-
-                function fillAllFields(payloadObject) {
-                    var definitions = fieldDefinitions();
-                    var orderedKeys = [
-                        'wages',
-                        'federalIncomeTaxWithheld',
-                        'medicareWagesAndTips',
-                        'stateIncomeTaxWithheld',
-                        'socialSecurityTips',
-                        'allocatedTips'
-                    ];
-                    var definitionsByKey = {};
-                    var filledCount = 0;
-                    var requestedCount = 0;
-
-                    for (var d = 0; d < definitions.length; d += 1) {
-                        definitions[d].orderIndex = d;
-                        definitionsByKey[definitions[d].key] = definitions[d];
-                    }
-
-                    for (var i = 0; i < orderedKeys.length; i += 1) {
-                        var definition = definitionsByKey[orderedKeys[i]];
-                        if (!definition) {
-                            continue;
-                        }
-
-                        var value = String((payloadObject && payloadObject[definition.key]) || '').trim();
-                        if (!value) {
-                            continue;
-                        }
-
-                        requestedCount += 1;
-
-                        var patterns = definition.patterns.concat([normalizeKey(definition.key)]);
-                        var candidates = queryAllAcrossDocuments('input, textarea, [contenteditable=\\\"true\\\"]').filter(function(candidate) {
-                            return isVisible(candidate) && !candidate.disabled && !candidate.readOnly;
-                        });
-
-                        var bestMatch = null;
-                        var bestScore = -1;
-
-                        bestMatch = exactModelCandidate(definition);
-                        if (bestMatch) {
-                            logDebug('W2 exact model match', definition.key, candidateText(bestMatch), 'value', value);
-                        }
-
-                        if (!bestMatch) {
-
-                        for (var j = 0; j < candidates.length; j += 1) {
-                            var candidate = candidates[j];
-                            var context = normalize(getElementContext(candidate) + ' ' + candidateText(candidate));
-                            var matched = false;
-
-                            for (var k = 0; k < patterns.length; k += 1) {
-                                if (context.indexOf(patterns[k]) !== -1) {
-                                    matched = true;
-                                    break;
-                                }
-                            }
-
-                            if (!matched) {
-                                continue;
-                            }
-
-                            if (context.length > bestScore) {
-                                bestScore = context.length;
-                                bestMatch = candidate;
-                            }
-                        }
-
-                        }
-
-                        if (!bestMatch && definition.key === 'wages') {
-                            var emptyCandidates = queryAllAcrossDocuments('input, textarea, [contenteditable=\\\"true\\\"]').filter(function(candidate) {
-                                return isVisible(candidate) && !candidate.disabled && !candidate.readOnly;
-                            });
-
-                            for (var n = 0; n < emptyCandidates.length; n += 1) {
-                                var emptyCandidate = emptyCandidates[n];
-                                var currentValue = emptyCandidate.isContentEditable ? emptyCandidate.textContent : emptyCandidate.value;
-                                if (!normalize(currentValue || '').length) {
-                                    bestMatch = emptyCandidate;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!bestMatch) {
-                            var containerCandidates = allContainerCandidates();
-                            for (var c = 0; c < containerCandidates.length; c += 1) {
-                                var container = containerCandidates[c];
-                                var containerContext = normalize(visibleText(container) + ' ' + elementText(container));
-                                var containerMatches = false;
-
-                                for (var p = 0; p < patterns.length; p += 1) {
-                                    if (containerContext.indexOf(patterns[p]) !== -1) {
-                                        containerMatches = true;
-                                        break;
-                                    }
-                                }
-
-                                if (!containerMatches) {
-                                    continue;
-                                }
-
-                                var containerFields = Array.from(container.querySelectorAll('input, textarea, [contenteditable=\\\"true\\\"]')).filter(function(candidate) {
-                                    return isVisible(candidate) && !candidate.disabled && !candidate.readOnly;
-                                });
-
-                                if (containerFields.length > 0) {
-                                    bestMatch = containerFields[0];
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (!bestMatch) {
-                            continue;
-                        }
-
-                        var angularApplied = setAngularModelValue(bestMatch, definition, value);
-                        if (angularApplied || nativeSetValue(bestMatch, value)) {
-                            bestMatch.setAttribute('value', value);
-                            bestMatch.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                            bestMatch.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                            bestMatch.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: value, inputType: 'insertText' }));
-                            bestMatch.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Tab' }));
-                            bestMatch.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Tab' }));
-                            filledCount += 1;
-                            logDebug('W2 field applied', definition.key, 'angular=' + String(angularApplied), 'value=' + value);
-                        }
-                    }
-
-                    return requestedCount > 0 && filledCount === requestedCount;
-                }
-
-
-                function firstEmptyVisibleCandidate() {
-                    var candidates = queryAllAcrossDocuments('input, textarea, [contenteditable=\\\"true\\\"]').filter(function(candidate) {
-                        return isVisible(candidate) && !candidate.disabled && !candidate.readOnly;
-                    });
-
-                    for (var i = 0; i < candidates.length; i += 1) {
-                        var candidate = candidates[i];
-                        var currentValue = candidate.isContentEditable ? candidate.textContent : candidate.value;
-                        if (!normalize(currentValue || '').length) {
-                            return candidate;
-                        }
-                    }
-
-                    return null;
-                }
-
-                function bestWageCandidate() {
-                    var exactPatterns = [
-                        'wages tips other compensations',
-                        'wages tips other compensation',
-                        'wages tips and other compensation',
-                        'your income',
-                        'w2 income',
-                        'w2 wages',
-                        'box 1',
-                        'wages'
-                    ];
-
-                    var candidates = queryAllAcrossDocuments('input, textarea, [contenteditable=\\\"true\\\"]').filter(function(candidate) {
-                        return isVisible(candidate) && !candidate.disabled && !candidate.readOnly;
-                    });
-
-                    var bestMatch = null;
-                    var bestScore = -1;
-
-                    for (var i = 0; i < candidates.length; i += 1) {
-                        var candidate = candidates[i];
-                        var context = normalize(candidateText(candidate));
-
-                        if (context === 'wages tips other compensations' ||
-                            context.indexOf('wages tips other compensation') !== -1 ||
-                            context.indexOf('wages tips and other compensation') !== -1 ||
-                            context.indexOf('your income') !== -1 ||
-                            context.indexOf('w2 income') !== -1 ||
-                            context.indexOf('w2 wages') !== -1 ||
-                            context.indexOf('box 1') !== -1 ||
-                            context.indexOf('wages') !== -1) {
-                                var score = context.length;
-                                if (score > bestScore) {
-                                    bestScore = score;
-                                    bestMatch = candidate;
-                                }
-                        }
-                    }
-
-                    return bestMatch || firstEmptyVisibleCandidate();
-                }
-
-                var wageValue = String((payload && payload.wages) || '').trim();
-                if (!wageValue) {
                     return false;
-                }
-
-                var target = bestWageCandidate();
-                if (!target) {
-                    return false;
-                }
-
-                var applied = nativeSetValue(target, wageValue);
-                if (applied) {
-                    target.setAttribute('value', wageValue);
-                    target.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: wageValue, inputType: 'insertText' }));
-                    target.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Tab' }));
-                    target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Tab' }));
-                }
-
-                return fillAllFields(payload);
                 } catch (error) {
-                    logDebug('W2 JS exception', String(error), error && error.stack ? error.stack : '');
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
+                        window.webkit.messageHandlers.taxFactsDebug.postMessage('W2 JS exception ' + String(error));
+                    }
                     return false;
                 }
             })(\(payloadJSON));
+            """ : """
+            (function() {
+                try {
+                    var state = window.__taxFactsW2PrefillState;
+                    if (!state || !state.payloads) {
+                        return false;
+                    }
+
+                    return state.documentIndex >= state.payloads.length;
+                } catch (error) {
+                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
+                        window.webkit.messageHandlers.taxFactsDebug.postMessage('W2 JS exception ' + String(error));
+                    }
+                    return false;
+                }
+            })();
             """
 
-            webView.evaluateJavaScript(directFillScript) { [weak self] result, _ in
+            webView.evaluateJavaScript(script) { [weak self] result, error in
                 guard let self else { return }
 
-                if let success = result as? Bool, success {
-                    self.handledW2PopulateRequestID = self.parent.w2PopulateRequestID
-                    self.parent.pendingW2Fields = nil
-                    self.stopW2PrefillRetryLoop()
+                if let error {
+                    print("[TaxAndFacts] W2 prefill JS error: \(error.localizedDescription)")
+                }
+
+                if shouldSubmitPayload {
+                    print("[TaxAndFacts] W2 prefill JS submit result: \(String(describing: result))")
+                    self.submittedW2PopulateRequestID = requestID
                     return
+                }
+
+                print("[TaxAndFacts] W2 prefill status result: \(String(describing: result))")
+                if let success = result as? Bool, success {
+                    print("[TaxAndFacts] W2 fill succeeded for request \(self.parent.w2PopulateRequestID)")
+                    self.handledW2PopulateRequestID = self.parent.w2PopulateRequestID
+                    self.parent.pendingW2Documents = []
+                    self.parent.shouldPopulateQueuedW2Documents = false
+                    self.submittedW2PopulateRequestID = -1
+                    self.stopW2PrefillRetryLoop()
                 }
             }
         }
@@ -2121,7 +2024,9 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             w2PrefillRetryCount = 0
 
             if !keepPayload {
-                parent.pendingW2Fields = nil
+                parent.pendingW2Documents = []
+                parent.shouldPopulateQueuedW2Documents = false
+                submittedW2PopulateRequestID = -1
             }
         }
 
@@ -2155,6 +2060,10 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             return payload
         }
 
+        private func w2PayloadArray(from documents: [W2ExtractedFields]) -> [[String: String]] {
+            documents.map { w2PayloadDictionary(from: $0) }.filter { !$0.isEmpty }
+        }
+
         private func numericOnlyString(_ value: String?) -> String? {
             let trimmedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !trimmedValue.isEmpty else { return nil }
@@ -2165,9 +2074,8 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             return result.isEmpty ? nil : result
         }
 
-        private func jsonObjectString(from dictionary: [String: String]) -> String? {
-            guard !dictionary.isEmpty,
-                  let data = try? JSONSerialization.data(withJSONObject: dictionary, options: []),
+        private func jsonObjectString(from object: Any) -> String? {
+            guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
                   let json = String(data: data, encoding: .utf8) else {
                 return nil
             }
@@ -2576,7 +2484,21 @@ private enum TextRecognizer {
                 return []
             }
 
-            let observations = request.results ?? []
+            let observations = (request.results ?? []).sorted { left, right in
+                let leftBox = left.boundingBox
+                let rightBox = right.boundingBox
+
+                if abs(leftBox.midY - rightBox.midY) > 0.01 {
+                    return leftBox.midY > rightBox.midY
+                }
+
+                if abs(leftBox.minX - rightBox.minX) > 0.01 {
+                    return leftBox.minX < rightBox.minX
+                }
+
+                return leftBox.width > rightBox.width
+            }
+
             return observations.compactMap { observation in
                 guard let text = observation.topCandidates(1).first?.string else { return nil }
                 return RecognizedTextItem(text: text, boundingBox: observation.boundingBox)
@@ -2675,14 +2597,24 @@ private enum W2FieldExtractor {
 
     private static let socialSecurityTipsSpec = FieldSpec(labels: [
         "box 7 social security tips",
+        "box 7 social security tip",
+        "box7 social security tips",
+        "box7 social security tip",
         "7 social security tips",
-        "social security tips"
+        "7 social security tip",
+        "social security tips",
+        "social security tip"
     ])
 
     private static let allocatedTipsSpec = FieldSpec(labels: [
         "box 8 allocated tips",
+        "box 8 allocated tip",
+        "box8 allocated tips",
+        "box8 allocated tip",
         "8 allocated tips",
-        "allocated tips"
+        "8 allocated tip",
+        "allocated tips",
+        "allocated tip"
     ])
 
     private static let stateTaxSpec = FieldSpec(labels: [
@@ -2704,15 +2636,16 @@ private enum W2FieldExtractor {
 
     static func extractFields(from text: String, items: [RecognizedTextItem] = []) -> W2ExtractedFields {
         let fallbackFields = extractFieldsFromText(text)
-
-        return W2ExtractedFields(
-            wages: extractPositionedValue(from: items, spec: wagesSpec, minimumWholeDollarDigits: 5) ?? fallbackFields.wages,
+        let extractedFields = W2ExtractedFields(
+            wages: extractPositionedValue(from: items, spec: wagesSpec, minimumWholeDollarDigits: 1) ?? fallbackFields.wages,
             federalIncomeTaxWithheld: extractPositionedValue(from: items, spec: federalTaxSpec) ?? fallbackFields.federalIncomeTaxWithheld,
             medicareWagesAndTips: extractPositionedValue(from: items, spec: medicareSpec) ?? fallbackFields.medicareWagesAndTips,
             stateIncomeTaxWithheld: extractPositionedValue(from: items, spec: stateTaxSpec, minimumWholeDollarDigits: 3) ?? fallbackFields.stateIncomeTaxWithheld,
-            socialSecurityTips: extractTipFieldValue(from: items, spec: socialSecurityTipsSpec),
-            allocatedTips: extractTipFieldValue(from: items, spec: allocatedTipsSpec)
+            socialSecurityTips: extractPositionedValue(from: items, spec: socialSecurityTipsSpec, minimumWholeDollarDigits: 4, treatAsTipField: true) ?? fallbackFields.socialSecurityTips,
+            allocatedTips: extractPositionedValue(from: items, spec: allocatedTipsSpec, minimumWholeDollarDigits: 4, treatAsTipField: true) ?? fallbackFields.allocatedTips
         )
+
+        return extractedFields
     }
 
     private static func extractFieldsFromText(_ text: String) -> W2ExtractedFields {
@@ -2721,67 +2654,67 @@ private enum W2FieldExtractor {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
+        debugMatchingTipLabels(in: lines, label: "text")
+
         return W2ExtractedFields(
-            wages: extractValueAfterLabel(from: lines, spec: wagesSpec, minimumWholeDollarDigits: 5),
+            wages: extractValueAfterLabel(from: lines, spec: wagesSpec, minimumWholeDollarDigits: 1),
             federalIncomeTaxWithheld: extractValueAfterLabel(from: lines, spec: federalTaxSpec),
             medicareWagesAndTips: extractValueAfterLabel(from: lines, spec: medicareSpec),
             stateIncomeTaxWithheld: extractValueAfterLabel(from: lines, spec: stateTaxSpec, minimumWholeDollarDigits: 3),
-            socialSecurityTips: extractTipFieldValue(from: lines, spec: socialSecurityTipsSpec),
-            allocatedTips: extractTipFieldValue(from: lines, spec: allocatedTipsSpec)
+            socialSecurityTips: extractValueAfterLabelStrict(from: lines, spec: socialSecurityTipsSpec, minimumWholeDollarDigits: 3),
+            allocatedTips: extractValueAfterLabelStrict(from: lines, spec: allocatedTipsSpec, minimumWholeDollarDigits: 3)
         )
     }
 
-    private static func extractTipFieldValue(from items: [RecognizedTextItem], spec: FieldSpec) -> String? {
-        for labelItem in items where containsAnyLabel(labelItem.text, labels: spec.labels) {
-            if let value = firstCurrencyValue(in: textAfterBestLabel(in: labelItem.text, labels: spec.labels), allowsWholeDollars: true),
-               isAcceptableCurrencyValue(value, minimumWholeDollarDigits: 3) {
-                return value
-            }
+    private static func debugMatchingTipLabels(in lines: [String], label: String) {
+        let socialMatches = lines.enumerated().filter { containsAnyLabel($0.element, labels: socialSecurityTipsSpec.labels) }
+        let allocatedMatches = lines.enumerated().filter { containsAnyLabel($0.element, labels: allocatedTipsSpec.labels) }
+
+        print("[TaxAndFacts][W2 Fetch] tip debug source=\(label) socialMatches=\(socialMatches.count) allocatedMatches=\(allocatedMatches.count)")
+
+        for match in socialMatches.prefix(3) {
+            print("[TaxAndFacts][W2 Fetch] tip debug social match[\(match.offset)]=\(match.element)")
         }
 
-        return nil
-    }
-
-    private static func extractTipFieldValue(from lines: [String], spec: FieldSpec) -> String? {
-        for line in lines {
-            let normalizedLine = normalizedSearchText(line)
-            guard spec.labels.contains(where: { normalizedLine.contains($0) }) else { continue }
-
-            if let value = firstCurrencyValue(in: textAfterBestLabel(in: line, labels: spec.labels), allowsWholeDollars: true),
-               isAcceptableCurrencyValue(value, minimumWholeDollarDigits: 3) {
-                return value
-            }
+        for match in allocatedMatches.prefix(3) {
+            print("[TaxAndFacts][W2 Fetch] tip debug allocated match[\(match.offset)]=\(match.element)")
         }
-
-        return nil
     }
 
     private static func extractPositionedValue(from items: [RecognizedTextItem], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
-        extractPositionedValue(from: items, spec: spec, minimumWholeDollarDigits: minimumWholeDollarDigits, allowRelaxedFallback: true)
+        extractPositionedValue(from: items, spec: spec, minimumWholeDollarDigits: minimumWholeDollarDigits, treatAsTipField: false)
     }
 
     private static func extractPositionedValue(
         from items: [RecognizedTextItem],
         spec: FieldSpec,
         minimumWholeDollarDigits: Int,
-        allowRelaxedFallback: Bool
+        treatAsTipField: Bool
     ) -> String? {
         guard !items.isEmpty else { return nil }
 
-        for labelItem in items where containsAnyLabel(labelItem.text, labels: spec.labels) {
+        for (labelIndex, labelItem) in items.enumerated() where containsAnyLabel(labelItem.text, labels: spec.labels) {
             if let value = firstCurrencyValue(in: textAfterBestLabel(in: labelItem.text, labels: spec.labels), allowsWholeDollars: true),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
 
-            let lowerBoundaryY = nextLowerW2LabelBoundaryY(in: items, below: labelItem.boundingBox)
-            let candidates = items.compactMap { item -> CandidateValue? in
-                guard item != labelItem,
-                      isLikelySameW2Box(candidate: item.boundingBox, label: labelItem.boundingBox, lowerBoundaryY: lowerBoundaryY),
-                      !containsAnyLabel(item.text, labels: allTargetLabels),
+            let searchEndIndex = items[(labelIndex + 1)...].firstIndex { item in
+                let normalized = normalizedSearchText(item.text)
+                return containsAnyLabel(normalized, labels: allTargetLabels) || containsIgnoredW2Label(item.text)
+            } ?? items.endIndex
+            let candidateRange = items[(labelIndex + 1)..<searchEndIndex]
+
+            let candidates = candidateRange.compactMap { item -> CandidateValue? in
+                guard !containsAnyLabel(item.text, labels: allTargetLabels),
                       !containsIgnoredW2Label(item.text),
                       let value = firstCurrencyValue(in: normalizedSearchText(item.text), allowsWholeDollars: true),
                       isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) else {
+                    return nil
+                }
+
+                let lowerBoundaryY = nextLowerW2LabelBoundaryY(in: items, below: labelItem.boundingBox)
+                guard isLikelySameW2Box(candidate: item.boundingBox, label: labelItem.boundingBox, lowerBoundaryY: lowerBoundaryY) else {
                     return nil
                 }
 
@@ -2793,13 +2726,27 @@ private enum W2FieldExtractor {
                 return bestValue
             }
 
-            if allowRelaxedFallback, minimumWholeDollarDigits > 1,
-               let relaxedValue = relaxedNearbyCurrencyValue(from: items, label: labelItem.boundingBox, minimumWholeDollarDigits: minimumWholeDollarDigits) {
+            if !treatAsTipField,
+               let relaxedValue = relaxedNearbyCurrencyValue(
+                    from: items,
+                    label: labelItem.boundingBox,
+                    minimumWholeDollarDigits: minimumWholeDollarDigits
+               ) {
                 return relaxedValue
             }
         }
 
         return nil
+    }
+
+    private static func isStandaloneNumericLine(_ text: String) -> Bool {
+        let normalizedText = normalizedSearchText(text)
+        guard !normalizedText.isEmpty else { return false }
+
+        let hasLetters = normalizedText.range(of: #"[a-z]"#, options: .regularExpression) != nil
+        guard !hasLetters else { return false }
+
+        return firstCurrencyValue(in: normalizedText, allowsWholeDollars: true) != nil
     }
 
     private static func extractValueAfterLabel(from lines: [String], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
@@ -2827,6 +2774,42 @@ private enum W2FieldExtractor {
             if secondNextLineIndex < lines.endIndex,
                !containsAnyLabel(lines[secondNextLineIndex], labels: allTargetLabels),
                !containsIgnoredW2Label(lines[secondNextLineIndex]),
+               let value = firstCurrencyValue(in: normalizedSearchText(lines[secondNextLineIndex]), allowsWholeDollars: true),
+               isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private static func extractValueAfterLabelStrict(from lines: [String], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
+        for (lineIndex, line) in lines.enumerated() {
+            let normalizedLine = normalizedSearchText(line)
+            guard spec.labels.contains(where: { normalizedLine.contains($0) }) else {
+                continue
+            }
+
+            if let value = firstCurrencyValue(in: textAfterBestLabel(in: line, labels: spec.labels), allowsWholeDollars: true),
+               isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
+                return value
+            }
+
+            let nextLineIndex = lines.index(after: lineIndex)
+            if nextLineIndex < lines.endIndex,
+               !containsAnyLabel(lines[nextLineIndex], labels: allTargetLabels),
+               !containsIgnoredW2Label(lines[nextLineIndex]),
+               isStandaloneNumericLine(lines[nextLineIndex]),
+               let value = firstCurrencyValue(in: normalizedSearchText(lines[nextLineIndex]), allowsWholeDollars: true),
+               isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
+                return value
+            }
+
+            let secondNextLineIndex = lines.index(after: nextLineIndex)
+            if secondNextLineIndex < lines.endIndex,
+               !containsAnyLabel(lines[secondNextLineIndex], labels: allTargetLabels),
+               !containsIgnoredW2Label(lines[secondNextLineIndex]),
+               isStandaloneNumericLine(lines[secondNextLineIndex]),
                let value = firstCurrencyValue(in: normalizedSearchText(lines[secondNextLineIndex]), allowsWholeDollars: true),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
@@ -3024,9 +3007,23 @@ private extension UIImage {
 }
 
 private struct CalculatorCaptureAlert: Identifiable {
+    enum Kind {
+        case info
+        case scanDecision
+    }
+
     let id = UUID()
     let title: String
     let message: String
+    let kind: Kind
+
+    static func scanDecision(documentNumber: Int) -> CalculatorCaptureAlert {
+        CalculatorCaptureAlert(
+            title: "Scan Another Document?",
+            message: "Document \(documentNumber) was captured. Scan another W-2 or finish to populate the calculator.",
+            kind: .scanDecision
+        )
+    }
 }
 
 private struct SavedArticleDetailView: View {
