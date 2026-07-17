@@ -2,8 +2,6 @@ import SwiftUI
 import UIKit
 import WebKit
 import UserNotifications
-import Vision
-import ImageIO
 import PhotosUI
 
 struct ContentView: View {
@@ -358,21 +356,18 @@ private struct HomeTabContainer: View {
             let captureText = extractedFields.summaryText
 
             await MainActor.run {
-                print("[TaxAndFacts] W2 extracted values: \(extractedFields.summaryText.replacingOccurrences(of: "\n", with: " | "))")
-
                 if extractedFields.hasAnyValue {
                     captureManager.saveCapture(
                         pageTitle: currentTitle,
                         urlString: currentURLString,
                         recognizedText: captureText
                     )
-                    print("[TaxAndFacts] W2 saved capture debug: socialSecurityTips=\(extractedFields.socialSecurityTips ?? "nil") allocatedTips=\(extractedFields.allocatedTips ?? "nil")")
-
                     pendingW2Documents.append(extractedFields)
 
                     if AppConfiguration.isCalculatorURL(currentURLString), isCalculatorStep2 {
                         captureAlert = CalculatorCaptureAlert.scanDecision(
-                            documentNumber: pendingW2Documents.count
+                            documentNumber: pendingW2Documents.count,
+                            isCameraCapture: source == .camera
                         )
                     } else {
                         beginW2Population()
@@ -402,6 +397,10 @@ private struct HomeTabContainer: View {
             return "No Text Found"
         }
 
+        if !hasWagesValue(extractedFields) {
+            return "No W-2 Fields Found"
+        }
+
         return extractedFields.hasAnyValue ? "W-2 Fields Saved" : "No W-2 Fields Found"
     }
 
@@ -410,11 +409,23 @@ private struct HomeTabContainer: View {
             return "No readable text was detected."
         }
 
+        if !hasWagesValue(extractedFields) {
+            return "Readable text was found, but no W-2 fields could be detected. Please retake the photo with the form clearly visible."
+        }
+
         if !extractedFields.hasAnyValue {
             return "Readable text was found, but none of the required W-2 fields were detected."
         }
 
         return extractedFields.summaryText
+    }
+
+    private func hasWagesValue(_ extractedFields: W2ExtractedFields) -> Bool {
+        guard let wages = extractedFields.wages?.trimmingCharacters(in: .whitespacesAndNewlines), !wages.isEmpty else {
+            return false
+        }
+
+        return true
     }
 
     private func previewMessage(for text: String) -> String {
@@ -446,7 +457,6 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorStepMessageName)
-        configuration.userContentController.add(context.coordinator, name: Coordinator.w2DebugMessageName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -491,7 +501,6 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         static let calculatorStepMessageName = "calculatorStep"
-        static let w2DebugMessageName = "taxFactsDebug"
 
         var parent: NativeWebViewWrapper
         var loadedURL: URL?
@@ -562,9 +571,6 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 return
             }
 
-            if message.name == Self.w2DebugMessageName {
-                return
-            }
         }
 
         private func handleNavigationError(_ error: Error) {
@@ -847,17 +853,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     return results;
                 }
 
-                function logDebug() {
-                    try {
-                        var parts = Array.prototype.slice.call(arguments).map(function(part) {
-                            return String(part);
-                        });
-                        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
-                            window.webkit.messageHandlers.taxFactsDebug.postMessage(parts.join(' '));
-                        }
-                    } catch (error) {
-                    }
-                }
+                function logDebug() {}
 
                 function fieldDefinitions() {
                     return [
@@ -865,14 +861,16 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                             key: 'wages',
                             modelName: 'wage',
                             ngModelPath: 'w2.wage',
-                            exactMatchers: ['t01', 'w2.wage', 'Wages, Tips, Other compensations'],
+                            exactMatchers: ['t01', 'w2.wage', 'Wages, Tips, Other compensations', 'Wages, tips, other comp.'],
                             patterns: [
                                 'w2 wages tips other compensations',
                                 'w2 wages tips other compensation',
                                 'wages tips other compensations',
                                 'wages tips other compensation',
                                 'wages tips and other compensation',
-                                'your income'
+                                'wages tips other comp',
+                                'box 1 wages tips other compensation',
+                                'box 1 wages tips other compensations'
                             ]
                         },
                         {
@@ -1106,6 +1104,25 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     return true;
                 }
 
+                function parseW2Amount(value) {
+                    if (value === undefined || value === null) {
+                        return 0;
+                    }
+
+                    var normalized = String(value).replace(/,/g, '').trim();
+                    if (!normalized) {
+                        return 0;
+                    }
+
+                    var parsed = parseFloat(normalized);
+                    return isNaN(parsed) ? 0 : parsed;
+                }
+
+                function formatW2Amount(value) {
+                    var parsed = typeof value === 'number' && isFinite(value) ? value : parseW2Amount(value);
+                    return parsed.toFixed(2);
+                }
+
                 function getTargetScope(element) {
                     if (!window.angular || !element) {
                         return null;
@@ -1147,6 +1164,116 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     }
 
                     return null;
+                }
+
+                function findScopeChainRoot(scope) {
+                    var current = scope;
+                    var lastMatch = null;
+
+                    while (current) {
+                        try {
+                            if (current.data && (current.data.total || Array.isArray(current.data.wages))) {
+                                lastMatch = current;
+                            }
+                        } catch (error) {
+                        }
+
+                        current = current.$parent || null;
+                    }
+
+                    return lastMatch || scope || null;
+                }
+
+                function syncW2SummaryValues(state, currentIndex) {
+                    if (!state || !state.payloads || state.payloads.length === 0) {
+                        logDebug('W2 summary sync skipped', 'reason=no-state-or-payloads');
+                        return;
+                    }
+
+                    var maxIndex = typeof currentIndex === 'number' ? currentIndex : (state.payloads.length - 1);
+                    if (maxIndex < 0) {
+                        logDebug('W2 summary sync skipped', 'reason=invalid-index', 'currentIndex=' + String(currentIndex));
+                        return;
+                    }
+
+                    var totals = {
+                        wage: 0,
+                        federal: 0,
+                        medi: 0,
+                        state: 0,
+                        tip: 0,
+                        overtime: 0
+                    };
+
+                    for (var i = 0; i <= maxIndex && i < state.payloads.length; i += 1) {
+                        var entry = state.payloads[i] || {};
+                        totals.wage += parseW2Amount(entry.wages);
+                        totals.federal += parseW2Amount(entry.federalIncomeTaxWithheld);
+                        totals.medi += parseW2Amount(entry.medicareWagesAndTips);
+                        totals.state += parseW2Amount(entry.stateIncomeTaxWithheld);
+                        totals.tip += parseW2Amount(entry.socialSecurityTips) + parseW2Amount(entry.allocatedTips);
+                        totals.overtime += parseW2Amount(entry.overtime);
+                    }
+
+                    var rootScope = null;
+                    try {
+                        if (window.angular) {
+                            var jq = window.angular.element(document.body || document.documentElement);
+                            if (jq && typeof jq.scope === 'function') {
+                                rootScope = jq.scope();
+                            }
+                            if (!rootScope && jq && typeof jq.isolateScope === 'function') {
+                                rootScope = jq.isolateScope();
+                            }
+                        }
+                    } catch (error) {
+                        rootScope = null;
+                    }
+
+                    rootScope = findScopeChainRoot(rootScope);
+                    if (!rootScope) {
+                        logDebug('W2 summary sync scope missing', 'docIndex=' + String(maxIndex), 'payloadCount=' + String(state.payloads.length));
+                        return;
+                    }
+
+                    var totalScope = null;
+                    var scopeWalker = rootScope;
+                    while (scopeWalker && !totalScope) {
+                        if (scopeWalker.data && scopeWalker.data.total) {
+                            totalScope = scopeWalker;
+                            break;
+                        }
+
+                        scopeWalker = scopeWalker.$parent || null;
+                    }
+
+                    if (!totalScope) {
+                        logDebug('W2 summary sync total scope missing', 'docIndex=' + String(maxIndex), 'hasRoot=' + String(!!rootScope));
+                        return;
+                    }
+
+                    if (!totalScope.data.total) {
+                        totalScope.data.total = {};
+                    }
+
+                    totalScope.data.total.wage = totals.wage;
+                    totalScope.data.total.federal = totals.federal;
+                    totalScope.data.total.medi = totals.medi;
+                    totalScope.data.total.state = totals.state;
+                    totalScope.data.total.tip = totals.tip;
+                    totalScope.data.total.overtime = totals.overtime;
+                    totalScope.data.total.tipMax = totals.tip;
+                    totalScope.data.total.tipmax = totals.tip;
+                    totalScope.data.total.overtimeMax = totals.overtime;
+
+                    if (typeof totalScope.$applyAsync === 'function') {
+                        totalScope.$applyAsync();
+                    } else if (typeof totalScope.$apply === 'function') {
+                        totalScope.$apply();
+                    }
+
+                    logDebug('W2 summary synced', 'docIndex=' + String(maxIndex), 'wage=' + String(totalScope.data.total.wage), 'federal=' + String(totalScope.data.total.federal), 'medi=' + String(totalScope.data.total.medi), 'state=' + String(totalScope.data.total.state), 'tip=' + String(totalScope.data.total.tip));
+                    logDebug('W2 summary scope snapshot', 'docIndex=' + String(maxIndex), 'hasTotal=' + String(!!(totalScope.data && totalScope.data.total)), 'keys=' + Object.keys(totalScope.data.total || {}).join(','), 'raw=' + JSON.stringify(totalScope.data.total || {}));
                 }
 
                 function setAngularModelValue(definition, value, targetElement) {
@@ -1476,26 +1603,151 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         }
                     }
 
+                    if (definition && definition.key === 'wages') {
+                        logDebug('W2 wages bestCandidateForDefinition', 'candidateCount=' + String(candidates.length), 'bestMatch=' + String(!!bestMatch), 'bestScore=' + String(bestScore));
+                        for (var n = 0; n < Math.min(candidates.length, 8); n += 1) {
+                            var candidate = candidates[n];
+                            logDebug(
+                                'W2 wages candidate[' + String(n) + ']',
+                                'text=' + candidateText(candidate),
+                                'context=' + getElementContext(candidate),
+                                'value=' + String(candidate.value || ''),
+                                'class=' + String(candidate.className || ''),
+                                'visible=' + String(isVisible(candidate)),
+                                'disabled=' + String(!!candidate.disabled),
+                                'readOnly=' + String(!!candidate.readOnly),
+                                'rect=' + JSON.stringify((function() {
+                                    try {
+                                        var rect = candidate.getBoundingClientRect();
+                                        return { top: rect.top, left: rect.left, width: rect.width, height: rect.height };
+                                    } catch (error) {
+                                        return null;
+                                    }
+                                })())
+                            );
+                        }
+                    }
+
                     return bestMatch;
+                }
+
+                function currentDocumentIndex() {
+                    return state && typeof state.documentIndex === 'number' ? state.documentIndex : 0;
+                }
+
+                function visibleW2Rows() {
+                    return queryAllAcrossDocuments('[ng-repeat="w2 in data.wages"], [data-ng-repeat="w2 in data.wages"]').filter(function(row) {
+                        return isVisible(row);
+                    });
+                }
+
+                function rowContainerForDocumentIndex(index) {
+                    var rows = visibleW2Rows();
+                    if (!rows || rows.length === 0) {
+                        return null;
+                    }
+
+                    if (index >= 0 && index < rows.length) {
+                        return rows[index];
+                    }
+
+                    return rows[rows.length - 1];
+                }
+
+                function targetCandidateWithinRow(row, definition) {
+                    if (!row || !definition || !definition.ngModelPath) {
+                        return null;
+                    }
+
+                    var selectors = [
+                        '[ng-model="' + definition.ngModelPath + '"]',
+                        '[data-ng-model="' + definition.ngModelPath + '"]',
+                        '[name="' + definition.modelName + '"]'
+                    ];
+
+                    for (var i = 0; i < selectors.length; i += 1) {
+                        var rowTarget = row.querySelector(selectors[i]);
+                        if (rowTarget) {
+                            return rowTarget;
+                        }
+                    }
+
+                    return null;
+                }
+
+                function candidatesForDefinition(definition) {
+                    if (!definition || !definition.ngModelPath) {
+                        return [];
+                    }
+
+                    return queryAllAcrossDocuments('[ng-model="' + definition.ngModelPath + '"], [data-ng-model="' + definition.ngModelPath + '"], [name="' + definition.modelName + '"]');
+                }
+
+                function exactModelCandidate(definition) {
+                    var matches = candidatesForDefinition(definition);
+                    for (var i = 0; i < matches.length; i += 1) {
+                        if (matchesExactDefinition(matches[i], definition)) {
+                            return matches[i];
+                        }
+                    }
+
+                    return matches.length > 0 ? matches[0] : null;
                 }
 
                 function targetCandidateForDefinition(definition) {
                     var targetIndex = currentDocumentIndex();
                     var targetRow = rowContainerForDocumentIndex(targetIndex);
+                    if (definition && definition.key === 'wages') {
+                        logDebug(
+                            'W2 wages targetCandidateForDefinition',
+                            'docIndex=' + String(targetIndex),
+                            'hasRow=' + String(!!targetRow),
+                            'rowCount=' + String(visibleW2Rows().length),
+                            'candidateCount=' + String(candidatesForDefinition(definition).length)
+                        );
+                    }
                     if (targetRow) {
                         var rowMatch = targetCandidateWithinRow(targetRow, definition);
                         if (rowMatch) {
+                            if (definition && definition.key === 'wages') {
+                                logDebug(
+                                    'W2 wages row match',
+                                    'label=' + candidateText(rowMatch),
+                                    'context=' + getElementContext(rowMatch),
+                                    'value=' + String(rowMatch.value || ''),
+                                    'class=' + String(rowMatch.className || '')
+                                );
+                            }
                             return rowMatch;
                         }
                     }
 
                     var candidates = candidatesForDefinition(definition);
                     if (candidates.length > targetIndex) {
+                        if (definition && definition.key === 'wages') {
+                            logDebug(
+                                'W2 wages index fallback',
+                                'docIndex=' + String(targetIndex),
+                                'selectedIndex=' + String(targetIndex),
+                                'selectedLabel=' + candidateText(candidates[targetIndex]),
+                                'selectedContext=' + getElementContext(candidates[targetIndex]),
+                                'selectedValue=' + String(candidates[targetIndex].value || '')
+                            );
+                        }
                         return candidates[targetIndex];
                     }
 
                     var bestMatch = bestCandidateForDefinition(definition);
                     if (bestMatch) {
+                        if (definition && definition.key === 'wages') {
+                            logDebug(
+                                'W2 wages best fallback',
+                                'label=' + candidateText(bestMatch),
+                                'context=' + getElementContext(bestMatch),
+                                'value=' + String(bestMatch.value || ''),
+                                'class=' + String(bestMatch.className || '')
+                            );
+                        }
                         return bestMatch;
                     }
 
@@ -1506,6 +1758,16 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         });
 
                         for (var i = 0; i < containerFields.length; i += 1) {
+                            if (definition && definition.key === 'wages') {
+                                logDebug(
+                                    'W2 wages container fallback',
+                                    'container=' + String(container.tagName || ''),
+                                    'fieldCount=' + String(containerFields.length),
+                                    'selectedLabel=' + candidateText(containerFields[i]),
+                                    'selectedContext=' + getElementContext(containerFields[i]),
+                                    'selectedValue=' + String(containerFields[i].value || '')
+                                );
+                            }
                             return containerFields[i];
                         }
                     }
@@ -1741,14 +2003,14 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         return null;
                     }
 
-                    function applyFieldValue(target, definition, value) {
-                        if (!target || !definition || !value) {
+                    function applyFieldValue(target, definition, numericValue, displayValue) {
+                        if (!target || !definition || numericValue === undefined || numericValue === null) {
                             return false;
                         }
 
                         var modelApplied = false;
                         try {
-                            modelApplied = setAngularModelValue(definition, value, target);
+                            modelApplied = setAngularModelValue(definition, numericValue, target);
                         } catch (error) {
                             logDebug('W2 model write error', definition.key, String(error));
                         }
@@ -1756,9 +2018,9 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         var domApplied = false;
                         try {
                             if (target.isContentEditable) {
-                                domApplied = setEditableValue(target, value);
+                                domApplied = setEditableValue(target, displayValue);
                             } else {
-                                domApplied = setInputValue(target, value);
+                                domApplied = setInputValue(target, displayValue);
                             }
                         } catch (error) {
                             logDebug('W2 DOM write error', definition.key, String(error));
@@ -1812,17 +2074,43 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     );
 
                     logDebug('W2 current row', 'docIndex=' + String(state.documentIndex), 'rowCount=' + String(visibleW2Rows().length), 'hasRow=' + String(!!currentRow));
+                    if (currentRow) {
+                        try {
+                            var rowScopeBefore = getTargetScope(currentRow);
+                            logDebug('W2 row scope before fill', 'docIndex=' + String(state.documentIndex), 'hasScope=' + String(!!rowScopeBefore), 'raw=' + JSON.stringify(rowScopeBefore && rowScopeBefore.data && rowScopeBefore.data.w2 ? rowScopeBefore.data.w2 : {}));
+                        } catch (rowScopeError) {
+                            logDebug('W2 row scope before fill error', String(rowScopeError));
+                        }
+                    }
 
                     if (hasTipValues && currentRow) {
                         var rowScope = getTargetScope(currentRow);
                         if (rowScope && rowScope.data) {
                             rowScope.data.checkTip = true;
+                            if (rowScope.w2 && typeof rowScope.w2 === 'object') {
+                                rowScope.w2.checkTip = true;
+                            }
+                            if (rowScope.w2 && (rowScope.w2.overtime === undefined || rowScope.w2.overtime === null || String(rowScope.w2.overtime).trim() === '')) {
+                                rowScope.w2.overtime = '0.00';
+                            }
+                            if (rowScope.data.w2 && (rowScope.data.w2.overtime === undefined || rowScope.data.w2.overtime === null || String(rowScope.data.w2.overtime).trim() === '')) {
+                                rowScope.data.w2.overtime = '0.00';
+                            }
+                            if (rowScope.data && Array.isArray(rowScope.data.wages)) {
+                                var wageRow = rowScope.data.wages[state.documentIndex];
+                                if (wageRow && typeof wageRow === 'object') {
+                                    wageRow.checkTip = true;
+                                }
+                                if (wageRow && (wageRow.overtime === undefined || wageRow.overtime === null || String(wageRow.overtime).trim() === '')) {
+                                    wageRow.overtime = '0.00';
+                                }
+                            }
                             if (typeof rowScope.$applyAsync === 'function') {
                                 rowScope.$applyAsync();
                             } else if (typeof rowScope.$apply === 'function') {
                                 rowScope.$apply();
                             }
-                            logDebug('W2 tip section enabled', 'docIndex=' + String(state.documentIndex));
+                            logDebug('W2 tip section enabled', 'docIndex=' + String(state.documentIndex), 'rowCheckTip=' + String(!!(rowScope.w2 && rowScope.w2.checkTip)), 'dataCheckTip=' + String(!!rowScope.data.checkTip));
                         }
                     }
 
@@ -1832,10 +2120,17 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
                     for (var i = 0; i < orderedKeys.length; i += 1) {
                         var key = orderedKeys[i];
-                        var value = String((payload && payload[key]) || '').trim();
-                        if (!value) {
+                        var rawValue = payload && Object.prototype.hasOwnProperty.call(payload, key) ? payload[key] : null;
+                        if (rawValue === undefined || rawValue === null || rawValue === '') {
                             continue;
                         }
+
+                        var numericValue = typeof rawValue === 'number' ? rawValue : parseW2Amount(rawValue);
+                        if (!isFinite(numericValue)) {
+                            continue;
+                        }
+
+                        var displayValue = formatW2Amount(numericValue);
 
                         var definition = definitionsByKey[key];
                         if (!definition) {
@@ -1849,16 +2144,28 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                         }
 
                         logDebug('W2 target chosen', key, 'docIndex=' + String(state.documentIndex), 'label=' + candidateText(target), 'context=' + getElementContext(target));
-                        var applied = applyFieldValue(target, definition, value);
-                        logDebug('W2 field applied', key, 'applied=' + String(applied), 'value=' + value);
+                        var applied = applyFieldValue(target, definition, numericValue, displayValue);
+                        logDebug('W2 field applied', key, 'applied=' + String(applied), 'numeric=' + String(numericValue), 'display=' + displayValue);
                         if (applied) {
                             filledCount += 1;
                         }
                     }
 
                     if (filledCount === 0) {
+                        logDebug('W2 fill produced no applied fields', 'docIndex=' + String(state.documentIndex), 'payload=' + JSON.stringify(payload || {}));
                         window.setTimeout(scheduleAttempt, 250);
                         return false;
+                    }
+
+                    syncW2SummaryValues(state, state.documentIndex);
+
+                    try {
+                        if (currentRow) {
+                            var rowScopeAfter = getTargetScope(currentRow);
+                            logDebug('W2 row scope after fill', 'docIndex=' + String(state.documentIndex), 'hasScope=' + String(!!rowScopeAfter), 'raw=' + JSON.stringify(rowScopeAfter && rowScopeAfter.data && rowScopeAfter.data.w2 ? rowScopeAfter.data.w2 : {}));
+                        }
+                    } catch (rowScopeAfterError) {
+                        logDebug('W2 row scope after fill error', String(rowScopeAfterError));
                     }
 
                     if (state.documentIndex + 1 < state.payloads.length) {
@@ -1969,9 +2276,6 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
                     return false;
                 } catch (error) {
-                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
-                        window.webkit.messageHandlers.taxFactsDebug.postMessage('W2 JS exception ' + String(error));
-                    }
                     return false;
                 }
             })(\(payloadJSON));
@@ -1985,9 +2289,6 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
                     return state.documentIndex >= state.payloads.length;
                 } catch (error) {
-                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.taxFactsDebug) {
-                        window.webkit.messageHandlers.taxFactsDebug.postMessage('W2 JS exception ' + String(error));
-                    }
                     return false;
                 }
             })();
@@ -1997,18 +2298,15 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 guard let self else { return }
 
                 if let error {
-                    print("[TaxAndFacts] W2 prefill JS error: \(error.localizedDescription)")
+                    _ = error
                 }
 
                 if shouldSubmitPayload {
-                    print("[TaxAndFacts] W2 prefill JS submit result: \(String(describing: result))")
                     self.submittedW2PopulateRequestID = requestID
                     return
                 }
 
-                print("[TaxAndFacts] W2 prefill status result: \(String(describing: result))")
                 if let success = result as? Bool, success {
-                    print("[TaxAndFacts] W2 fill succeeded for request \(self.parent.w2PopulateRequestID)")
                     self.handledW2PopulateRequestID = self.parent.w2PopulateRequestID
                     self.parent.pendingW2Documents = []
                     self.parent.shouldPopulateQueuedW2Documents = false
@@ -2030,48 +2328,53 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             }
         }
 
-        private func w2PayloadDictionary(from fields: W2ExtractedFields) -> [String: String] {
-            var payload: [String: String] = [:]
+        private func w2PayloadDictionary(from fields: W2ExtractedFields) -> [String: Any] {
+            var payload: [String: Any] = [:]
 
-            if let value = numericOnlyString(fields.wages) {
+            if let value = numericOnlyDouble(fields.wages) {
                 payload["wages"] = value
             }
 
-            if let value = numericOnlyString(fields.federalIncomeTaxWithheld) {
+            if let value = numericOnlyDouble(fields.federalIncomeTaxWithheld) {
                 payload["federalIncomeTaxWithheld"] = value
             }
 
-            if let value = numericOnlyString(fields.medicareWagesAndTips) {
+            if let value = numericOnlyDouble(fields.medicareWagesAndTips) {
                 payload["medicareWagesAndTips"] = value
             }
 
-            if let value = numericOnlyString(fields.stateIncomeTaxWithheld) {
+            if let value = numericOnlyDouble(fields.stateIncomeTaxWithheld) {
                 payload["stateIncomeTaxWithheld"] = value
             }
 
-            if let value = numericOnlyString(fields.socialSecurityTips) {
+            if let value = numericOnlyDouble(fields.socialSecurityTips) {
                 payload["socialSecurityTips"] = value
+            } else {
+                payload["socialSecurityTips"] = 0.0
             }
 
-            if let value = numericOnlyString(fields.allocatedTips) {
+            if let value = numericOnlyDouble(fields.allocatedTips) {
                 payload["allocatedTips"] = value
+            } else {
+                payload["allocatedTips"] = 0.0
             }
 
             return payload
         }
 
-        private func w2PayloadArray(from documents: [W2ExtractedFields]) -> [[String: String]] {
+        private func w2PayloadArray(from documents: [W2ExtractedFields]) -> [[String: Any]] {
             documents.map { w2PayloadDictionary(from: $0) }.filter { !$0.isEmpty }
         }
 
-        private func numericOnlyString(_ value: String?) -> String? {
+        private func numericOnlyDouble(_ value: String?) -> Double? {
             let trimmedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !trimmedValue.isEmpty else { return nil }
 
             let allowedCharacters = CharacterSet(charactersIn: "0123456789.,-")
             let filtered = trimmedValue.unicodeScalars.filter { allowedCharacters.contains($0) }
-            let result = String(String.UnicodeScalarView(filtered))
-            return result.isEmpty ? nil : result
+            let result = String(String.UnicodeScalarView(filtered)).replacingOccurrences(of: ",", with: "")
+            guard !result.isEmpty else { return nil }
+            return Double(result)
         }
 
         private func jsonObjectString(from object: Any) -> String? {
@@ -2456,102 +2759,16 @@ private struct PhotoLibraryCaptureView: UIViewControllerRepresentable {
     }
 }
 
-private struct RecognizedTextItem: Equatable {
-    let text: String
-    let boundingBox: CGRect
-}
-
-private enum TextRecognizer {
-    static func recognizeTextItems(in image: UIImage) async -> [RecognizedTextItem] {
-        let orientation = image.cgImagePropertyOrientation
-
-        return await Task.detached(priority: .userInitiated) {
-            guard let cgImage = image.cgImage else { return [] }
-
-            let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = true
-
-            let handler = VNImageRequestHandler(
-                cgImage: cgImage,
-                orientation: orientation,
-                options: [:]
-            )
-
-            do {
-                try handler.perform([request])
-            } catch {
-                return []
-            }
-
-            let observations = (request.results ?? []).sorted { left, right in
-                let leftBox = left.boundingBox
-                let rightBox = right.boundingBox
-
-                if abs(leftBox.midY - rightBox.midY) > 0.01 {
-                    return leftBox.midY > rightBox.midY
-                }
-
-                if abs(leftBox.minX - rightBox.minX) > 0.01 {
-                    return leftBox.minX < rightBox.minX
-                }
-
-                return leftBox.width > rightBox.width
-            }
-
-            return observations.compactMap { observation in
-                guard let text = observation.topCandidates(1).first?.string else { return nil }
-                return RecognizedTextItem(text: text, boundingBox: observation.boundingBox)
-            }
-        }.value
-    }
-}
-
-private struct W2ExtractedFields: Equatable {
-    let wages: String?
-    let federalIncomeTaxWithheld: String?
-    let medicareWagesAndTips: String?
-    let stateIncomeTaxWithheld: String?
-    let socialSecurityTips: String?
-    let allocatedTips: String?
-
-    var summaryText: String {
-        [
-            "Wages, tips, other comp: \(summaryValue(wages))",
-            "Federal income tax withheld: \(summaryValue(federalIncomeTaxWithheld))",
-            "Medicare wages and tips: \(summaryValue(medicareWagesAndTips))",
-            "State income tax: \(summaryValue(stateIncomeTaxWithheld))",
-            "Social security tips: \(summaryValue(socialSecurityTips))",
-            "Allocated tips: \(summaryValue(allocatedTips))"
-        ]
-        .joined(separator: "\n")
-    }
-
-    var hasAnyValue: Bool {
-        [wages, federalIncomeTaxWithheld, medicareWagesAndTips, stateIncomeTaxWithheld, socialSecurityTips, allocatedTips]
-            .contains { value in
-                guard let value else { return false }
-                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-    }
-
-    private func summaryValue(_ value: String?) -> String {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return "—"
-        }
-
-        return value
-    }
-}
-
 private enum W2FieldExtractor {
     private struct FieldSpec {
         let labels: [String]
+        let preferLargestNumericValue: Bool
     }
 
     private struct CandidateValue {
         let value: String
         let score: CGFloat
+        let numericValue: Double
     }
 
     private static let wagesSpec = FieldSpec(labels: [
@@ -2562,6 +2779,7 @@ private enum W2FieldExtractor {
         "w2 wage tips other compensation",
         "w2 wage tips other compensations",
         "wages tips and other comp",
+        "wages tips, other comp.",
         "wages tips and other compensation",
         "wages tips and other compensations",
         "wages tips other comp",
@@ -2571,7 +2789,7 @@ private enum W2FieldExtractor {
         "wage tips and other compensation",
         "wage tips other comp",
         "wage tips other compensation"
-    ])
+    ], preferLargestNumericValue: true)
 
     private static let federalTaxSpec = FieldSpec(labels: [
         "box 2 federal income tax withheld",
@@ -2583,7 +2801,7 @@ private enum W2FieldExtractor {
         "federal tax withheld",
         "federal tax with held",
         "income tax withheld"
-    ])
+    ], preferLargestNumericValue: false)
 
     private static let medicareSpec = FieldSpec(labels: [
         "box 5 medicare wages and tips",
@@ -2593,7 +2811,7 @@ private enum W2FieldExtractor {
         "medicare wages",
         "madicare wages and tips",
         "madicare wages tips"
-    ])
+    ], preferLargestNumericValue: false)
 
     private static let socialSecurityTipsSpec = FieldSpec(labels: [
         "box 7 social security tips",
@@ -2604,7 +2822,7 @@ private enum W2FieldExtractor {
         "7 social security tip",
         "social security tips",
         "social security tip"
-    ])
+    ], preferLargestNumericValue: false)
 
     private static let allocatedTipsSpec = FieldSpec(labels: [
         "box 8 allocated tips",
@@ -2615,7 +2833,7 @@ private enum W2FieldExtractor {
         "8 allocated tip",
         "allocated tips",
         "allocated tip"
-    ])
+    ], preferLargestNumericValue: false)
 
     private static let stateTaxSpec = FieldSpec(labels: [
         "box 17 state income tax",
@@ -2628,7 +2846,7 @@ private enum W2FieldExtractor {
         "state income tax",
         "state tax withheld",
         "state tax"
-    ])
+    ], preferLargestNumericValue: false)
 
     private static var allTargetLabels: [String] {
         [wagesSpec, federalTaxSpec, medicareSpec, socialSecurityTipsSpec, allocatedTipsSpec, stateTaxSpec].flatMap(\.labels)
@@ -2667,18 +2885,6 @@ private enum W2FieldExtractor {
     }
 
     private static func debugMatchingTipLabels(in lines: [String], label: String) {
-        let socialMatches = lines.enumerated().filter { containsAnyLabel($0.element, labels: socialSecurityTipsSpec.labels) }
-        let allocatedMatches = lines.enumerated().filter { containsAnyLabel($0.element, labels: allocatedTipsSpec.labels) }
-
-        print("[TaxAndFacts][W2 Fetch] tip debug source=\(label) socialMatches=\(socialMatches.count) allocatedMatches=\(allocatedMatches.count)")
-
-        for match in socialMatches.prefix(3) {
-            print("[TaxAndFacts][W2 Fetch] tip debug social match[\(match.offset)]=\(match.element)")
-        }
-
-        for match in allocatedMatches.prefix(3) {
-            print("[TaxAndFacts][W2 Fetch] tip debug allocated match[\(match.offset)]=\(match.element)")
-        }
     }
 
     private static func extractPositionedValue(from items: [RecognizedTextItem], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
@@ -2693,9 +2899,111 @@ private enum W2FieldExtractor {
     ) -> String? {
         guard !items.isEmpty else { return nil }
 
-        for (labelIndex, labelItem) in items.enumerated() where containsAnyLabel(labelItem.text, labels: spec.labels) {
-            if let value = firstCurrencyValue(in: textAfterBestLabel(in: labelItem.text, labels: spec.labels), allowsWholeDollars: true),
+        for (labelIndex, labelItem) in items.enumerated() where matchesFieldLabel(labelItem.text, spec: spec) {
+            let isWagesField = spec.labels == wagesSpec.labels
+            let isStateField = spec.labels == stateTaxSpec.labels
+            let preferLargestValue = !isWagesField && spec.preferLargestNumericValue
+            var debugCandidates: [CandidateValue] = []
+
+            if isWagesField {
+                let spatialCandidates = items.compactMap { item -> CandidateValue? in
+                    guard item != labelItem,
+                          !containsAnyLabel(item.text, labels: allTargetLabels),
+                          !containsIgnoredW2Label(item.text),
+                          let value = bestCurrencyValue(
+                            in: normalizedSearchText(item.text),
+                            allowsWholeDollars: true,
+                            preferLargestValue: true
+                          ),
+                          isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) else {
+                        return nil
+                    }
+
+                    let candidate = item.boundingBox
+                    let label = labelItem.boundingBox
+                    let isBelowLabel = candidate.midY <= label.midY - 0.01
+                    let isInLeftColumn = abs(candidate.midX - label.midX) <= max(CGFloat(0.20), label.width * 1.25)
+                    guard isBelowLabel, isInLeftColumn else {
+                        return nil
+                    }
+
+                    let score = abs(candidate.midY - label.maxY) + abs(candidate.midX - label.midX) * 0.5
+                    return CandidateValue(value: value, score: score, numericValue: Double(value) ?? 0)
+                }
+
+                if let bestSpatialValue = selectCandidateValue(from: spatialCandidates, preferLargestValue: false)?.value {
+                    if isWagesField {
+                        debugWagesExtraction(
+                            labelItem: labelItem,
+                            textAfterLabel: textAfterBestLabel(in: labelItem.text, labels: spec.labels),
+                            candidateRange: Array(items),
+                            candidates: spatialCandidates,
+                            selectedValue: bestSpatialValue
+                        )
+                    } else if isStateField {
+                        debugStateExtraction(
+                            labelItem: labelItem,
+                            candidateRange: Array(items),
+                            candidates: spatialCandidates,
+                            selectedValue: bestSpatialValue,
+                            branch: "spatial"
+                        )
+                    }
+                    return bestSpatialValue
+                }
+            } else if isStateField {
+                let spatialCandidates = items.compactMap { item -> CandidateValue? in
+                    guard item != labelItem,
+                          !containsAnyLabel(item.text, labels: allTargetLabels),
+                          !containsIgnoredW2Label(item.text),
+                          let value = bestCurrencyValue(
+                            in: normalizedSearchText(item.text),
+                            allowsWholeDollars: true,
+                            preferLargestValue: false
+                          ),
+                          isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) else {
+                        return nil
+                    }
+
+                    let candidate = item.boundingBox
+                    let label = labelItem.boundingBox
+                    let isBelowLabel = candidate.midY <= label.midY - 0.01
+                    let isNearColumn = abs(candidate.midX - label.midX) <= max(CGFloat(0.22), label.width * 1.25)
+                    guard isBelowLabel, isNearColumn else {
+                        return nil
+                    }
+
+                    let score = abs(candidate.midY - label.midY) + abs(candidate.midX - label.midX) * 0.5
+                    return CandidateValue(value: value, score: score, numericValue: Double(value) ?? 0)
+                }
+
+                if let bestSpatialValue = selectCandidateValue(from: spatialCandidates, preferLargestValue: false)?.value {
+                    debugStateExtraction(
+                        labelItem: labelItem,
+                        candidateRange: Array(items),
+                        candidates: spatialCandidates,
+                        selectedValue: bestSpatialValue,
+                        branch: "spatial"
+                    )
+                    return bestSpatialValue
+                }
+            }
+
+            if let value = bestCurrencyValue(
+                in: textAfterBestLabel(in: labelItem.text, labels: spec.labels),
+                allowsWholeDollars: true,
+                preferLargestValue: preferLargestValue
+            ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
+                if isStateField {
+                    debugStateExtraction(
+                        labelItem: labelItem,
+                        candidateRange: Array(items),
+                        candidates: [],
+                        selectedValue: value,
+                        branch: "inline"
+                    )
+                }
                 return value
             }
 
@@ -2708,7 +3016,11 @@ private enum W2FieldExtractor {
             let candidates = candidateRange.compactMap { item -> CandidateValue? in
                 guard !containsAnyLabel(item.text, labels: allTargetLabels),
                       !containsIgnoredW2Label(item.text),
-                      let value = firstCurrencyValue(in: normalizedSearchText(item.text), allowsWholeDollars: true),
+                      let value = bestCurrencyValue(
+                        in: normalizedSearchText(item.text),
+                        allowsWholeDollars: true,
+                        preferLargestValue: preferLargestValue
+                      ),
                       isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) else {
                     return nil
                 }
@@ -2719,10 +3031,31 @@ private enum W2FieldExtractor {
                 }
 
                 let score = spatialScore(candidate: item.boundingBox, label: labelItem.boundingBox)
-                return CandidateValue(value: value, score: score)
+                return CandidateValue(value: value, score: score, numericValue: Double(value) ?? 0)
             }
 
-            if let bestValue = candidates.min(by: { $0.score < $1.score })?.value {
+            if isWagesField {
+                debugCandidates = candidates
+            }
+
+            if let bestValue = selectCandidateValue(from: candidates, preferLargestValue: preferLargestValue)?.value {
+                if isWagesField {
+                    debugWagesExtraction(
+                        labelItem: labelItem,
+                        textAfterLabel: textAfterBestLabel(in: labelItem.text, labels: spec.labels),
+                        candidateRange: Array(candidateRange),
+                        candidates: candidates,
+                        selectedValue: bestValue
+                    )
+                } else if isStateField {
+                    debugStateExtraction(
+                        labelItem: labelItem,
+                        candidateRange: Array(candidateRange),
+                        candidates: candidates,
+                        selectedValue: bestValue,
+                        branch: "candidateRange"
+                    )
+                }
                 return bestValue
             }
 
@@ -2730,9 +3063,46 @@ private enum W2FieldExtractor {
                let relaxedValue = relaxedNearbyCurrencyValue(
                     from: items,
                     label: labelItem.boundingBox,
-                    minimumWholeDollarDigits: minimumWholeDollarDigits
+                    minimumWholeDollarDigits: minimumWholeDollarDigits,
+                    preferLargestValue: preferLargestValue
                ) {
+                if isWagesField {
+                    debugWagesExtraction(
+                        labelItem: labelItem,
+                        textAfterLabel: textAfterBestLabel(in: labelItem.text, labels: spec.labels),
+                        candidateRange: Array(candidateRange),
+                        candidates: debugCandidates,
+                        selectedValue: relaxedValue,
+                        usedRelaxedFallback: true
+                    )
+                } else if isStateField {
+                    debugStateExtraction(
+                        labelItem: labelItem,
+                        candidateRange: Array(candidateRange),
+                        candidates: debugCandidates,
+                        selectedValue: relaxedValue,
+                        branch: "relaxed"
+                    )
+                }
                 return relaxedValue
+            }
+
+            if isWagesField {
+                debugWagesExtraction(
+                    labelItem: labelItem,
+                    textAfterLabel: textAfterBestLabel(in: labelItem.text, labels: spec.labels),
+                    candidateRange: Array(candidateRange),
+                    candidates: candidates,
+                    selectedValue: nil
+                )
+            } else if isStateField {
+                debugStateExtraction(
+                    labelItem: labelItem,
+                    candidateRange: Array(candidateRange),
+                    candidates: candidates,
+                    selectedValue: nil,
+                    branch: "none"
+                )
             }
         }
 
@@ -2752,11 +3122,15 @@ private enum W2FieldExtractor {
     private static func extractValueAfterLabel(from lines: [String], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
         for lineIndex in lines.indices {
             let normalizedLine = normalizedSearchText(lines[lineIndex])
-            guard spec.labels.contains(where: { normalizedLine.contains($0) }) else {
+            guard matchesFieldLabel(normalizedLine, spec: spec) else {
                 continue
             }
 
-            if let value = firstCurrencyValue(in: textAfterBestLabel(in: lines[lineIndex], labels: spec.labels), allowsWholeDollars: true),
+            if let value = bestCurrencyValue(
+                in: textAfterBestLabel(in: lines[lineIndex], labels: spec.labels),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+            ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2765,7 +3139,11 @@ private enum W2FieldExtractor {
             if nextLineIndex < lines.endIndex,
                !containsAnyLabel(lines[nextLineIndex], labels: allTargetLabels),
                !containsIgnoredW2Label(lines[nextLineIndex]),
-               let value = firstCurrencyValue(in: normalizedSearchText(lines[nextLineIndex]), allowsWholeDollars: true),
+               let value = bestCurrencyValue(
+                in: normalizedSearchText(lines[nextLineIndex]),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+               ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2774,7 +3152,11 @@ private enum W2FieldExtractor {
             if secondNextLineIndex < lines.endIndex,
                !containsAnyLabel(lines[secondNextLineIndex], labels: allTargetLabels),
                !containsIgnoredW2Label(lines[secondNextLineIndex]),
-               let value = firstCurrencyValue(in: normalizedSearchText(lines[secondNextLineIndex]), allowsWholeDollars: true),
+               let value = bestCurrencyValue(
+                in: normalizedSearchText(lines[secondNextLineIndex]),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+               ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2786,11 +3168,15 @@ private enum W2FieldExtractor {
     private static func extractValueAfterLabelStrict(from lines: [String], spec: FieldSpec, minimumWholeDollarDigits: Int = 1) -> String? {
         for (lineIndex, line) in lines.enumerated() {
             let normalizedLine = normalizedSearchText(line)
-            guard spec.labels.contains(where: { normalizedLine.contains($0) }) else {
+            guard matchesFieldLabel(normalizedLine, spec: spec) else {
                 continue
             }
 
-            if let value = firstCurrencyValue(in: textAfterBestLabel(in: line, labels: spec.labels), allowsWholeDollars: true),
+            if let value = bestCurrencyValue(
+                in: textAfterBestLabel(in: line, labels: spec.labels),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+            ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2800,7 +3186,11 @@ private enum W2FieldExtractor {
                !containsAnyLabel(lines[nextLineIndex], labels: allTargetLabels),
                !containsIgnoredW2Label(lines[nextLineIndex]),
                isStandaloneNumericLine(lines[nextLineIndex]),
-               let value = firstCurrencyValue(in: normalizedSearchText(lines[nextLineIndex]), allowsWholeDollars: true),
+               let value = bestCurrencyValue(
+                in: normalizedSearchText(lines[nextLineIndex]),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+               ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2810,7 +3200,11 @@ private enum W2FieldExtractor {
                !containsAnyLabel(lines[secondNextLineIndex], labels: allTargetLabels),
                !containsIgnoredW2Label(lines[secondNextLineIndex]),
                isStandaloneNumericLine(lines[secondNextLineIndex]),
-               let value = firstCurrencyValue(in: normalizedSearchText(lines[secondNextLineIndex]), allowsWholeDollars: true),
+               let value = bestCurrencyValue(
+                in: normalizedSearchText(lines[secondNextLineIndex]),
+                allowsWholeDollars: true,
+                preferLargestValue: spec.labels == wagesSpec.labels ? false : spec.preferLargestNumericValue
+               ),
                isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) {
                 return value
             }
@@ -2826,8 +3220,8 @@ private enum W2FieldExtractor {
         let labelMidY = label.midY
         let sameColumnTolerance = max(CGFloat(0.18), label.width * 1.1)
         let isSameColumn = abs(candidateMidX - labelMidX) <= sameColumnTolerance
-        let isSameOrBelowLabel = candidateMidY <= labelMidY + 0.035
-        let isNearVertically = candidateMidY >= labelMidY - 0.16
+        let isSameOrBelowLabel = candidateMidY <= labelMidY - 0.01
+        let isNearVertically = candidateMidY >= labelMidY - 0.20
         let isAboveNextBox = lowerBoundaryY.map { candidateMidY > $0 } ?? true
 
         return isSameColumn && isSameOrBelowLabel && isNearVertically && isAboveNextBox
@@ -2865,6 +3259,18 @@ private enum W2FieldExtractor {
         return normalizedText
     }
 
+    private static func matchesFieldLabel(_ text: String, spec: FieldSpec) -> Bool {
+        let normalizedText = normalizedSearchText(text)
+
+        if spec.preferLargestNumericValue {
+            let containsActualWageLabel = spec.labels.contains { normalizedText.contains($0) }
+            let looksLikeTotalSummary = normalizedText.contains("total") && normalizedText.contains("wages") && normalizedText.contains("comp")
+            return containsActualWageLabel && !looksLikeTotalSummary
+        }
+
+        return spec.labels.contains { normalizedText.contains($0) }
+    }
+
     private static func containsAnyLabel(_ text: String, labels: [String]) -> Bool {
         let normalizedText = normalizedSearchText(text)
         return labels.contains { normalizedText.contains($0) }
@@ -2875,6 +3281,9 @@ private enum W2FieldExtractor {
         "social security number",
         "social security tax withheld",
         "social security wages",
+        "total wages tips and other comp",
+        "total wages tips and other compensation",
+        "total wages tips and other compensations",
         "allocated tips",
         "dependent care benefits",
         "nonqualified plans",
@@ -2922,6 +3331,19 @@ private enum W2FieldExtractor {
         currencyValues(in: text, allowsWholeDollars: allowsWholeDollars).first
     }
 
+    private static func bestCurrencyValue(in text: String, allowsWholeDollars: Bool = false, preferLargestValue: Bool = false) -> String? {
+        let values = currencyValues(in: text, allowsWholeDollars: allowsWholeDollars)
+        guard !values.isEmpty else { return nil }
+
+        if preferLargestValue {
+            return values.max { left, right in
+                (Double(left) ?? 0) < (Double(right) ?? 0)
+            }
+        }
+
+        return values.first
+    }
+
     private static func isAcceptableCurrencyValue(_ value: String, minimumWholeDollarDigits: Int) -> Bool {
         guard minimumWholeDollarDigits > 1, !value.contains("."), !value.contains(",") else {
             return true
@@ -2934,12 +3356,17 @@ private enum W2FieldExtractor {
     private static func relaxedNearbyCurrencyValue(
         from items: [RecognizedTextItem],
         label: CGRect,
-        minimumWholeDollarDigits: Int
+        minimumWholeDollarDigits: Int,
+        preferLargestValue: Bool
     ) -> String? {
         let relaxedCandidates = items.compactMap { item -> CandidateValue? in
             guard !containsAnyLabel(item.text, labels: allTargetLabels),
                   !containsIgnoredW2Label(item.text),
-                  let value = firstCurrencyValue(in: normalizedSearchText(item.text), allowsWholeDollars: true),
+                  let value = bestCurrencyValue(
+                    in: normalizedSearchText(item.text),
+                    allowsWholeDollars: true,
+                    preferLargestValue: preferLargestValue
+                  ),
                   isAcceptableCurrencyValue(value, minimumWholeDollarDigits: minimumWholeDollarDigits) else {
                 return nil
             }
@@ -2953,10 +3380,45 @@ private enum W2FieldExtractor {
             }
 
             let score = spatialScore(candidate: item.boundingBox, label: label)
-            return CandidateValue(value: value, score: score)
+            return CandidateValue(value: value, score: score, numericValue: Double(value) ?? 0)
         }
 
-        return relaxedCandidates.min(by: { $0.score < $1.score })?.value
+        return selectCandidateValue(from: relaxedCandidates, preferLargestValue: preferLargestValue)?.value
+    }
+
+    private static func selectCandidateValue(from candidates: [CandidateValue], preferLargestValue: Bool) -> CandidateValue? {
+        guard !candidates.isEmpty else { return nil }
+
+        if preferLargestValue {
+            return candidates.max { left, right in
+                if left.numericValue == right.numericValue {
+                    return left.score > right.score
+                }
+
+                return left.numericValue < right.numericValue
+            }
+        }
+
+        return candidates.min(by: { $0.score < $1.score })
+    }
+
+    private static func debugWagesExtraction(
+        labelItem: RecognizedTextItem,
+        textAfterLabel: String,
+        candidateRange: [RecognizedTextItem],
+        candidates: [CandidateValue],
+        selectedValue: String?,
+        usedRelaxedFallback: Bool = false
+    ) {
+    }
+
+    private static func debugStateExtraction(
+        labelItem: RecognizedTextItem,
+        candidateRange: [RecognizedTextItem],
+        candidates: [CandidateValue],
+        selectedValue: String?,
+        branch: String
+    ) {
     }
 
     private static func currencyValues(in text: String, allowsWholeDollars: Bool = false) -> [String] {
@@ -2981,31 +3443,6 @@ private enum W2FieldExtractor {
     }
 }
 
-private extension UIImage {
-    var cgImagePropertyOrientation: CGImagePropertyOrientation {
-        switch imageOrientation {
-        case .up:
-            return .up
-        case .upMirrored:
-            return .upMirrored
-        case .down:
-            return .down
-        case .downMirrored:
-            return .downMirrored
-        case .left:
-            return .left
-        case .leftMirrored:
-            return .leftMirrored
-        case .right:
-            return .right
-        case .rightMirrored:
-            return .rightMirrored
-        @unknown default:
-            return .up
-        }
-    }
-}
-
 private struct CalculatorCaptureAlert: Identifiable {
     enum Kind {
         case info
@@ -3017,10 +3454,17 @@ private struct CalculatorCaptureAlert: Identifiable {
     let message: String
     let kind: Kind
 
-    static func scanDecision(documentNumber: Int) -> CalculatorCaptureAlert {
-        CalculatorCaptureAlert(
+    static func scanDecision(documentNumber: Int, isCameraCapture: Bool) -> CalculatorCaptureAlert {
+        let message: String
+        if isCameraCapture {
+            message = "Document \(documentNumber) was captured from the camera. If the photo is blurry or the text is not sharp, the extracted values may be less reliable. Scan another W-2 or finish to populate the calculator."
+        } else {
+            message = "Document \(documentNumber) was captured. Scan another W-2 or finish to populate the calculator."
+        }
+
+        return CalculatorCaptureAlert(
             title: "Scan Another Document?",
-            message: "Document \(documentNumber) was captured. Scan another W-2 or finish to populate the calculator.",
+            message: message,
             kind: .scanDecision
         )
     }
