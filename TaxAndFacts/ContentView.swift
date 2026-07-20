@@ -128,6 +128,7 @@ struct ContentView: View {
     }
 }
 
+ #if false
 private enum AppScreen {
     case home
     case saved
@@ -180,6 +181,8 @@ private enum AppConfiguration {
     }
 }
 
+#endif
+
 private struct HomeTabContainer: View {
     private enum W2ScanSource {
         case camera
@@ -204,9 +207,26 @@ private struct HomeTabContainer: View {
     @State private var isShowingCaptureOptions = false
     @State private var isRecognizingText = false
     @State private var isCalculatorStep2 = false
+    @State private var isCalculatorStep4 = false
     @State private var captureAlert: CalculatorCaptureAlert?
     @State private var lastW2ScanSource: W2ScanSource = .camera
     @State private var shouldPopulateQueuedW2Documents = false
+    @State private var resultPageCaptureController = ResultPageCaptureController()
+    @State private var isShowingResultSaveOptions = false
+    @State private var isShowingResultShareSheet = false
+    @State private var resultShareURL: URL?
+    @State private var isSavingResultPage = false
+
+    private enum ResultPageSaveFormat {
+        case screenshot
+        case pdf
+    }
+
+    private var shouldShowResultSaveButton: Bool {
+        guard AppConfiguration.isCalculatorURL(currentURLString) else { return false }
+
+        return isCalculatorStep4
+    }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -230,6 +250,8 @@ private struct HomeTabContainer: View {
                     canGoBack: $canGoBack,
                     backRequestID: $backRequestID,
                     isCalculatorStep2: $isCalculatorStep2,
+                    isCalculatorStep4: $isCalculatorStep4,
+                    resultPageCaptureController: resultPageCaptureController,
                     onNavigationFinished: onNavigationFinished
                 )
 
@@ -249,6 +271,16 @@ private struct HomeTabContainer: View {
                     )
                     .padding(.trailing, 16)
                     .padding(.bottom, 18)
+                }
+
+                if shouldShowResultSaveButton {
+                    ResultPageSaveButton(
+                        isSaving: isSavingResultPage,
+                        action: showResultSaveOptions
+                    )
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 18)
+                    .zIndex(2)
                 }
             }
         }
@@ -276,6 +308,22 @@ private struct HomeTabContainer: View {
                 Label("Upload from Gallery", systemImage: "photo.on.rectangle")
             }
         }
+        .confirmationDialog("Save Result Page", isPresented: $isShowingResultSaveOptions, titleVisibility: .visible) {
+            Button("Save as Screenshot") {
+                saveCurrentResultPage(as: .screenshot)
+            }
+
+            Button("Save as PDF") {
+                saveCurrentResultPage(as: .pdf)
+            }
+        }
+        .sheet(isPresented: $isShowingResultShareSheet, onDismiss: {
+            resultShareURL = nil
+        }) {
+            if let resultShareURL {
+                ActivityView(activityItems: [resultShareURL])
+            }
+        }
         .alert(item: $captureAlert) { alert in
             switch alert.kind {
             case .info:
@@ -299,6 +347,10 @@ private struct HomeTabContainer: View {
         isShowingCaptureOptions = true
     }
 
+    private func showResultSaveOptions() {
+        isShowingResultSaveOptions = true
+    }
+
     private func toggleSavedPage() {
         if manager.isSaved(urlString: currentURLString) {
             manager.deleteArticle(urlString: currentURLString)
@@ -309,6 +361,63 @@ private struct HomeTabContainer: View {
                 htmlString: currentHTMLString,
                 imageURLString: currentImageURLString
             )
+        }
+    }
+
+    private func saveCurrentResultPage(as format: ResultPageSaveFormat) {
+        guard !isSavingResultPage else { return }
+        isSavingResultPage = true
+
+        Task { @MainActor in
+            defer { isSavingResultPage = false }
+
+            guard let snapshotImage = await resultPageCaptureController.captureSnapshotImage(),
+                  let screenshotData = snapshotImage.pngData() else {
+                captureAlert = CalculatorCaptureAlert.info(
+                    title: "Unable to Save",
+                    message: "The result page could not be captured. Please try again."
+                )
+                return
+            }
+
+            do {
+                let fileURL: URL
+
+                switch format {
+                case .screenshot:
+                    let fileName = "TaxAndFacts-Result-\(UUID().uuidString).png"
+                    fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+                    try screenshotData.write(to: fileURL, options: .atomic)
+                case .pdf:
+                    guard let pdfData = resultPageCaptureController.pdfData(from: snapshotImage) else {
+                        captureAlert = CalculatorCaptureAlert.info(
+                            title: "Unable to Create PDF",
+                            message: "The result page could not be converted into a PDF file."
+                        )
+                        return
+                    }
+
+                    let fileName = "TaxAndFacts-Result-\(UUID().uuidString).pdf"
+                    fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+                    try pdfData.write(to: fileURL, options: .atomic)
+                }
+
+                resultShareURL = fileURL
+                isShowingResultShareSheet = true
+            } catch {
+                let message: String
+                switch format {
+                case .screenshot:
+                    message = "The screenshot file could not be written."
+                case .pdf:
+                    message = "The PDF file could not be written."
+                }
+
+                captureAlert = CalculatorCaptureAlert.info(
+                    title: "Unable to Export",
+                    message: message
+                )
+            }
         }
     }
 
@@ -355,8 +464,21 @@ private struct HomeTabContainer: View {
             let extractedFields = W2FieldExtractor.extractFields(from: recognizedText, items: recognizedItems)
             let captureText = extractedFields.summaryText
 
+            print(
+                "[TaxAndFacts] W2 scan doc fetch: source=\(source == .camera ? "camera" : "photoLibrary") " +
+                "recognizedItems=\(recognizedItems.count) " +
+                "hasValues=\(extractedFields.hasAnyValue) " +
+                "wages=\(extractedFields.wages ?? "nil")"
+            )
+
             await MainActor.run {
-                if extractedFields.hasAnyValue {
+                if !hasWagesValue(extractedFields) {
+                    captureAlert = CalculatorCaptureAlert(
+                        title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
+                        message: captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields),
+                        kind: .info
+                    )
+                } else if extractedFields.hasAnyValue {
                     captureManager.saveCapture(
                         pageTitle: currentTitle,
                         urlString: currentURLString,
@@ -398,7 +520,7 @@ private struct HomeTabContainer: View {
         }
 
         if !hasWagesValue(extractedFields) {
-            return "No W-2 Fields Found"
+            return "No Wages Found"
         }
 
         return extractedFields.hasAnyValue ? "W-2 Fields Saved" : "No W-2 Fields Found"
@@ -410,7 +532,7 @@ private struct HomeTabContainer: View {
         }
 
         if !hasWagesValue(extractedFields) {
-            return "Readable text was found, but no W-2 fields could be detected. Please retake the photo with the form clearly visible."
+            return "No wages value was found in this W-2. Please retake the photo with Box 1 clearly visible."
         }
 
         if !extractedFields.hasAnyValue {
@@ -451,18 +573,22 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
     @Binding var canGoBack: Bool
     @Binding var backRequestID: Int
     @Binding var isCalculatorStep2: Bool
+    @Binding var isCalculatorStep4: Bool
+    let resultPageCaptureController: ResultPageCaptureController
     let onNavigationFinished: (URL, Bool) -> Void
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorStepMessageName)
+        configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorResultMessageName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.scrollView.showsVerticalScrollIndicator = false
         webView.allowsBackForwardNavigationGestures = true
+        resultPageCaptureController.attach(webView: webView)
         webView.load(request(for: url))
         context.coordinator.loadedURL = url
         return webView
@@ -485,7 +611,9 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             context.coordinator.loadedURL = url
         }
 
+        resultPageCaptureController.attach(webView: uiView)
         context.coordinator.installW2FieldPrefillSupport(into: uiView)
+        context.coordinator.updateCalculatorResultState(in: uiView)
         DispatchQueue.main.async {
             context.coordinator.attemptW2FieldPrefill(in: uiView)
         }
@@ -501,6 +629,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         static let calculatorStepMessageName = "calculatorStep"
+        static let calculatorResultMessageName = "calculatorResult"
 
         var parent: NativeWebViewWrapper
         var loadedURL: URL?
@@ -531,6 +660,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             updateCurrentImageURL(from: webView)
             injectNativeShellCSS(into: webView)
             updateCalculatorStepState(in: webView)
+            updateCalculatorResultState(in: webView)
             installW2FieldPrefillSupport(into: webView)
             attemptW2FieldPrefill(in: webView)
             resetScrollPosition(in: webView)
@@ -539,6 +669,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.canGoBack = webView.canGoBack
             parent.isCalculatorStep2 = false
+            parent.isCalculatorStep4 = false
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -571,6 +702,14 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 return
             }
 
+            if message.name == Self.calculatorResultMessageName {
+                if let isResultPage = message.body as? Bool {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.parent.isCalculatorStep4 = isResultPage
+                    }
+                }
+                return
+            }
         }
 
         private func handleNavigationError(_ error: Error) {
@@ -686,6 +825,12 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                            value === '2';
                 }
 
+                function containsStepFour(value) {
+                    return /\bstep\s*4\b/.test(value) ||
+                           /\b4\s*(of|\/)\s*\d+\b/.test(value) ||
+                           value === '4';
+                }
+
                 function isW2IncomeScreen() {
                     var pageText = (document.body ? document.body.innerText : '')
                         .replace(/\s+/g, ' ')
@@ -739,17 +884,50 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     return false;
                 }
 
-                function reportStep() {
+                function detectStepFour() {
+                    var activeSelectors = [
+                        '[aria-current=\"step\"]',
+                        '[aria-current=\"page\"]',
+                        '[aria-selected=\"true\"]',
+                        '[data-state=\"active\"]',
+                        '[data-active=\"true\"]',
+                        '.active',
+                        '.current',
+                        '.selected'
+                    ];
+
+                    for (var i = 0; i < activeSelectors.length; i++) {
+                        var activeElements = document.querySelectorAll(activeSelectors[i]);
+
+                        for (var j = 0; j < activeElements.length; j++) {
+                            if (isVisible(activeElements[j]) && containsStepFour(cleanText(activeElements[j]))) {
+                                return true;
+                            }
+                        }
+                    }
+
+                    var visibleHeadings = document.querySelectorAll('h1, h2, h3, h4, legend, [role=\"heading\"]');
+                    for (var k = 0; k < visibleHeadings.length; k++) {
+                        if (isVisible(visibleHeadings[k]) && containsStepFour(cleanText(visibleHeadings[k]))) {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                function reportState() {
                     window.webkit.messageHandlers.calculatorStep.postMessage(detectStepTwo());
+                    window.webkit.messageHandlers.calculatorResult.postMessage(detectStepFour());
                 }
 
                 if (!window.__taxFactsCalculatorStepObserverInstalled) {
                     window.__taxFactsCalculatorStepObserverInstalled = true;
-                    window.__taxFactsReportCalculatorStep = reportStep;
+                    window.__taxFactsReportCalculatorStep = reportState;
 
                     var scheduleReport = function() {
                         window.clearTimeout(window.__taxFactsCalculatorStepReportTimer);
-                        window.__taxFactsCalculatorStepReportTimer = window.setTimeout(reportStep, 80);
+                        window.__taxFactsCalculatorStepReportTimer = window.setTimeout(reportState, 80);
                     };
 
                     var observer = new MutationObserver(scheduleReport);
@@ -764,10 +942,170 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     });
                 }
 
-                window.__taxFactsReportCalculatorStep = reportStep;
-                reportStep();
-                window.setTimeout(reportStep, 250);
-                window.setTimeout(reportStep, 750);
+                window.__taxFactsReportCalculatorStep = reportState;
+                reportState();
+                window.setTimeout(reportState, 250);
+                window.setTimeout(reportState, 750);
+            })();
+            """#
+
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+
+        func updateCalculatorResultState(in webView: WKWebView) {
+            let currentURLString = webView.url?.absoluteString ?? ""
+            guard AppConfiguration.isCalculatorURL(currentURLString) else {
+                parent.isCalculatorStep4 = false
+                return
+            }
+
+            let script = #"""
+            (function() {
+                function isVisible(element) {
+                    if (!element) { return false; }
+
+                    var style = window.getComputedStyle(element);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        return false;
+                    }
+
+                    var rects = element.getClientRects();
+                    return rects.length > 0 && rects[0].width > 0 && rects[0].height > 0;
+                }
+
+                function cleanText(element) {
+                    var value = [
+                        element.innerText || '',
+                        element.textContent || '',
+                        element.getAttribute('aria-label') || '',
+                        element.getAttribute('title') || ''
+                    ].join(' ');
+
+                    return value.replace(/\s+/g, ' ').trim().toLowerCase();
+                }
+
+                function containsStepFour(value) {
+                    return /\bstep\s*4\b/.test(value) ||
+                           /\b4\s*(of|\/)\s*\d+\b/.test(value) ||
+                           value === '4';
+                }
+
+                function detectStepFour() {
+                    var pageText = (document.body ? document.body.innerText : '')
+                        .replace(/\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+
+                    if (pageText.includes('tax comparison') &&
+                        pageText.includes('with obbba') &&
+                        pageText.includes('without obbba')) {
+                        return true;
+                    }
+
+                    if (pageText.includes('pending tax payable') ||
+                        pageText.includes('federal tax paid') ||
+                        pageText.includes('refund')) {
+                        return true;
+                    }
+
+                    if (pageText.includes('step 4') || pageText.includes('4 of 4')) {
+                        return true;
+                    }
+
+                    var activeSelectors = [
+                        '[aria-current="step"]',
+                        '[aria-current="page"]',
+                        '[aria-selected="true"]',
+                        '[data-state="active"]',
+                        '[data-active="true"]',
+                        '.active',
+                        '.current',
+                        '.selected'
+                    ];
+
+                    for (var i = 0; i < activeSelectors.length; i++) {
+                        var activeElements = document.querySelectorAll(activeSelectors[i]);
+
+                        for (var j = 0; j < activeElements.length; j++) {
+                            if (isVisible(activeElements[j]) && containsStepFour(cleanText(activeElements[j]))) {
+                                return true;
+                            }
+                        }
+                    }
+
+                    var visibleHeadings = document.querySelectorAll('h1, h2, h3, h4, legend, [role="heading"]');
+                    for (var k = 0; k < visibleHeadings.length; k++) {
+                        if (isVisible(visibleHeadings[k]) && containsStepFour(cleanText(visibleHeadings[k]))) {
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                function hasVisibleText(value, selectors) {
+                    for (var i = 0; i < selectors.length; i++) {
+                        var elements = document.querySelectorAll(selectors[i]);
+
+                        for (var j = 0; j < elements.length; j++) {
+                            if (isVisible(elements[j]) && cleanText(elements[j]).indexOf(value) !== -1) {
+                                return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                }
+
+                function detectResultPage() {
+                    if (detectStepFour()) {
+                        return true;
+                    }
+
+                    var tableSelectors = ['table', 'tbody', 'tr', 'td', 'th'];
+                    var headingSelectors = ['h1', 'h2', 'h3', 'h4', 'legend', '[role=\"heading\"]'];
+                    var visibleTable = hasVisibleText('with obbba', tableSelectors) && hasVisibleText('without obbba', tableSelectors);
+                    var resultHeading = hasVisibleText('tax comparison', headingSelectors);
+
+                    if (!visibleTable || !resultHeading) {
+                        return false;
+                    }
+
+                    return hasVisibleText('pending tax payable', tableSelectors) ||
+                           hasVisibleText('refund', tableSelectors) ||
+                           hasVisibleText('tax on income', tableSelectors) ||
+                           hasVisibleText('federal tax paid', tableSelectors);
+                }
+
+                function reportResult() {
+                    window.webkit.messageHandlers.calculatorResult.postMessage(detectResultPage());
+                }
+
+                if (!window.__taxFactsCalculatorResultObserverInstalled) {
+                    window.__taxFactsCalculatorResultObserverInstalled = true;
+                    window.__taxFactsReportCalculatorResult = reportResult;
+
+                    var scheduleReport = function() {
+                        window.clearTimeout(window.__taxFactsCalculatorResultReportTimer);
+                        window.__taxFactsCalculatorResultReportTimer = window.setTimeout(reportResult, 80);
+                    };
+
+                    var observer = new MutationObserver(scheduleReport);
+                    observer.observe(document.body || document.documentElement, {
+                        attributes: true,
+                        childList: true,
+                        subtree: true
+                    });
+
+                    ['click', 'input', 'change', 'hashchange', 'popstate', 'scroll'].forEach(function(eventName) {
+                        window.addEventListener(eventName, scheduleReport, true);
+                    });
+                }
+
+                window.__taxFactsReportCalculatorResult = reportResult;
+                reportResult();
+                window.setTimeout(reportResult, 250);
+                window.setTimeout(reportResult, 750);
             })();
             """#
 
@@ -2640,13 +2978,49 @@ private struct CalculatorScanButton: View {
     let action: () -> Void
 
     var body: some View {
+        FloatingActionButton(
+            title: "Scan",
+            systemImage: "doc.viewfinder",
+            isProcessing: isProcessing,
+            processingLabel: "Extracting text",
+            restingLabel: "Scan W-2",
+            action: action
+        )
+    }
+}
+
+private struct ResultPageSaveButton: View {
+    let isSaving: Bool
+    let action: () -> Void
+
+    var body: some View {
+        FloatingActionButton(
+            title: "Save",
+            systemImage: "square.and.arrow.down",
+            isProcessing: isSaving,
+            processingLabel: "Saving result page",
+            restingLabel: "Save result page",
+            action: action
+        )
+    }
+}
+
+private struct FloatingActionButton: View {
+    let title: String
+    let systemImage: String
+    let isProcessing: Bool
+    let processingLabel: String
+    let restingLabel: String
+    let action: () -> Void
+
+    var body: some View {
         Button(action: action) {
             Group {
                 if isProcessing {
                     ProgressView()
                         .controlSize(.small)
                 } else {
-                    Label("Scan", systemImage: "doc.viewfinder")
+                    Label(title, systemImage: systemImage)
                         .font(.headline.weight(.semibold))
                 }
             }
@@ -2663,7 +3037,7 @@ private struct CalculatorScanButton: View {
         .buttonStyle(.plain)
         .disabled(isProcessing)
         .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
-        .accessibilityLabel(isProcessing ? "Extracting text" : "Scan W-2")
+        .accessibilityLabel(isProcessing ? processingLabel : restingLabel)
     }
 }
 
@@ -3262,18 +3636,20 @@ private enum W2FieldExtractor {
     private static func matchesFieldLabel(_ text: String, spec: FieldSpec) -> Bool {
         let normalizedText = normalizedSearchText(text)
 
+        let normalizedSpecLabels = normalizedLabels(spec.labels)
+
         if spec.preferLargestNumericValue {
-            let containsActualWageLabel = spec.labels.contains { normalizedText.contains($0) }
+            let containsActualWageLabel = normalizedSpecLabels.contains { normalizedText.contains($0) }
             let looksLikeTotalSummary = normalizedText.contains("total") && normalizedText.contains("wages") && normalizedText.contains("comp")
             return containsActualWageLabel && !looksLikeTotalSummary
         }
 
-        return spec.labels.contains { normalizedText.contains($0) }
+        return normalizedSpecLabels.contains { normalizedText.contains($0) }
     }
 
     private static func containsAnyLabel(_ text: String, labels: [String]) -> Bool {
         let normalizedText = normalizedSearchText(text)
-        return labels.contains { normalizedText.contains($0) }
+        return normalizedLabels(labels).contains { normalizedText.contains($0) }
     }
 
     private static let ignoredW2Labels: [String] = [
@@ -3325,6 +3701,17 @@ private enum W2FieldExtractor {
             .replacingOccurrences(of: #"[^a-z0-9.$]+"#, with: " ", options: .regularExpression)
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedLabels(_ labels: [String]) -> [String] {
+        labels.map { text in
+            text
+                .lowercased()
+                .replacingOccurrences(of: ",", with: "")
+                .replacingOccurrences(of: #"[^a-z0-9.$]+"#, with: " ", options: .regularExpression)
+                .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     private static func firstCurrencyValue(in text: String, allowsWholeDollars: Bool = false) -> String? {
@@ -3443,33 +3830,6 @@ private enum W2FieldExtractor {
     }
 }
 
-private struct CalculatorCaptureAlert: Identifiable {
-    enum Kind {
-        case info
-        case scanDecision
-    }
-
-    let id = UUID()
-    let title: String
-    let message: String
-    let kind: Kind
-
-    static func scanDecision(documentNumber: Int, isCameraCapture: Bool) -> CalculatorCaptureAlert {
-        let message: String
-        if isCameraCapture {
-            message = "Document \(documentNumber) was captured from the camera. If the photo is blurry or the text is not sharp, the extracted values may be less reliable. Scan another W-2 or finish to populate the calculator."
-        } else {
-            message = "Document \(documentNumber) was captured. Scan another W-2 or finish to populate the calculator."
-        }
-
-        return CalculatorCaptureAlert(
-            title: "Scan Another Document?",
-            message: message,
-            kind: .scanDecision
-        )
-    }
-}
-
 private struct SavedArticleDetailView: View {
     let article: SavedArticle
 
@@ -3503,6 +3863,7 @@ private struct OfflineHTMLView: UIViewRepresentable {
     }
 }
 
+ #if false
 private struct SavedArticle: Identifiable, Codable, Equatable {
     let id: UUID
     let title: String
@@ -3837,6 +4198,8 @@ private struct AppNavigationBar: View {
         .accessibilityLabel(title)
     }
 }
+
+#endif
 
 #Preview {
     ContentView()
