@@ -360,31 +360,229 @@ final class ResultPageCaptureController {
         self.webView = webView
     }
 
-    func captureSnapshotImage() async -> UIImage? {
+    func captureResultSectionPDFData() async -> Data? {
         guard let webView else { return nil }
 
-        return await withCheckedContinuation { continuation in
-            let visibleBounds = webView.bounds.integral
-            guard !visibleBounds.isEmpty else {
-                continuation.resume(returning: nil)
-                return
-            }
+        let visibleBounds = webView.bounds.integral
+        guard !visibleBounds.isEmpty else { return nil }
 
-            let configuration = WKSnapshotConfiguration()
-            configuration.afterScreenUpdates = true
-            configuration.rect = visibleBounds
+        let scrollView = webView.scrollView
+        let originalOffset = scrollView.contentOffset
+        let originalFrame = webView.frame
+        let originalBounds = webView.bounds
+        let metrics = await pageSectionMetrics(in: webView)
+        guard let cropRect = metrics.cropRect else { return nil }
 
-            webView.takeSnapshot(with: configuration) { image, _ in
-                if let image {
-                    continuation.resume(returning: image)
+        let captureFrame = CGRect(
+            x: originalFrame.origin.x,
+            y: originalFrame.origin.y,
+            width: max(originalFrame.width, metrics.pageWidth),
+            height: max(originalFrame.height, metrics.pageHeight)
+        )
+
+        webView.frame = captureFrame
+        webView.bounds = CGRect(origin: .zero, size: captureFrame.size)
+        scrollView.setContentOffset(.zero, animated: false)
+        webView.layoutIfNeeded()
+
+        defer {
+            webView.frame = originalFrame
+            webView.bounds = originalBounds
+            scrollView.setContentOffset(originalOffset, animated: false)
+            webView.layoutIfNeeded()
+        }
+
+        let configuration = WKPDFConfiguration()
+        configuration.rect = cropRect
+
+        do {
+            return try await webView.pdf(configuration: configuration)
+        } catch {
+            return nil
+        }
+    }
+
+    func renderImage(from pdfData: Data) -> UIImage? {
+        guard let provider = CGDataProvider(data: pdfData as CFData),
+              let pdfDocument = CGPDFDocument(provider),
+              let page = pdfDocument.page(at: 1) else {
+            return nil
+        }
+
+        let pageRect = page.getBoxRect(.mediaBox)
+        guard pageRect.width > 0, pageRect.height > 0 else { return nil }
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: pageRect.size, format: format)
+
+        return renderer.image { context in
+            UIColor.systemBackground.setFill()
+            context.fill(pageRect)
+
+            let cgContext = context.cgContext
+            cgContext.saveGState()
+            cgContext.translateBy(x: 0, y: pageRect.height)
+            cgContext.scaleBy(x: 1, y: -1)
+            cgContext.interpolationQuality = .high
+            cgContext.drawPDFPage(page)
+            cgContext.restoreGState()
+        }
+    }
+
+    private struct PageSectionMetrics {
+        let pageWidth: CGFloat
+        let pageHeight: CGFloat
+        let cropRect: CGRect?
+    }
+
+    private func pageSectionMetrics(in webView: WKWebView) async -> PageSectionMetrics {
+        await withCheckedContinuation { continuation in
+            let script = #"""
+            (function() {
+                function isVisible(element) {
+                    if (!element) { return false; }
+
+                    var style = window.getComputedStyle(element);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        return false;
+                    }
+
+                    var rects = element.getClientRects();
+                    return rects.length > 0 && rects[0].width > 0 && rects[0].height > 0;
+                }
+
+                function cleanText(element) {
+                    var value = [
+                        element.innerText || '',
+                        element.textContent || '',
+                        element.getAttribute('aria-label') || '',
+                        element.getAttribute('title') || '',
+                        element.value || ''
+                    ].join(' ');
+
+                    return value.replace(/\s+/g, ' ').trim().toLowerCase();
+                }
+
+                function pageWidth() {
+                    var body = document.body || {};
+                    var doc = document.documentElement || {};
+                    return Math.max(
+                        body.scrollWidth || 0,
+                        doc.scrollWidth || 0,
+                        body.offsetWidth || 0,
+                        doc.offsetWidth || 0,
+                        body.clientWidth || 0,
+                        doc.clientWidth || 0
+                    );
+                }
+
+                function pageHeight() {
+                    var body = document.body || {};
+                    var doc = document.documentElement || {};
+                    return Math.max(
+                        body.scrollHeight || 0,
+                        doc.scrollHeight || 0,
+                        body.offsetHeight || 0,
+                        doc.offsetHeight || 0,
+                        body.clientHeight || 0,
+                        doc.clientHeight || 0
+                    );
+                }
+
+                function firstMatchingTop(selectors, matcher) {
+                    var bestTop = null;
+
+                    for (var i = 0; i < selectors.length; i++) {
+                        var elements = document.querySelectorAll(selectors[i]);
+
+                        for (var j = 0; j < elements.length; j++) {
+                            var element = elements[j];
+                            if (!isVisible(element)) { continue; }
+
+                            var value = cleanText(element);
+                            if (!matcher(value)) { continue; }
+
+                            var rect = element.getBoundingClientRect();
+                            var top = rect.top + window.scrollY;
+                            if (bestTop === null || top < bestTop) {
+                                bestTop = top;
+                            }
+                        }
+                    }
+
+                    return bestTop;
+                }
+
+                var previousTop = firstMatchingTop(
+                    ['button', '[role="button"]', 'a', 'input[type="button"]', 'input[type="submit"]'],
+                    function(value) { return value.indexOf('previous') !== -1; }
+                );
+
+                var pageHeightValue = pageHeight();
+                var startY = 0;
+                var endY = previousTop !== null ? Math.min(pageHeightValue, previousTop - 8) : pageHeightValue;
+
+                if (endY < startY) {
+                    endY = pageHeightValue;
+                }
+
+                return {
+                    width: pageWidth(),
+                    height: pageHeightValue,
+                    startY: startY,
+                    endY: endY
+                };
+            })();
+            """#
+
+            webView.evaluateJavaScript(script) { result, _ in
+                guard let dictionary = result as? [String: Any] else {
+                    continuation.resume(
+                        returning: PageSectionMetrics(
+                            pageWidth: webView.bounds.width,
+                            pageHeight: webView.bounds.height,
+                            cropRect: nil
+                        )
+                    )
                     return
                 }
 
-                let renderer = UIGraphicsImageRenderer(bounds: visibleBounds)
-                let fallbackImage = renderer.image { _ in
-                    webView.drawHierarchy(in: visibleBounds, afterScreenUpdates: true)
-                }
-                continuation.resume(returning: fallbackImage)
+                let width = CGFloat(
+                    (dictionary["width"] as? NSNumber)?.doubleValue
+                    ?? (dictionary["width"] as? Double)
+                    ?? webView.bounds.width
+                )
+                let height = CGFloat(
+                    (dictionary["height"] as? NSNumber)?.doubleValue
+                    ?? (dictionary["height"] as? Double)
+                    ?? webView.bounds.height
+                )
+                let startY = CGFloat(
+                    (dictionary["startY"] as? NSNumber)?.doubleValue
+                    ?? (dictionary["startY"] as? Double)
+                    ?? 0
+                )
+                let endY = CGFloat(
+                    (dictionary["endY"] as? NSNumber)?.doubleValue
+                    ?? (dictionary["endY"] as? Double)
+                    ?? height
+                )
+                let cropHeight = max(1, endY - startY)
+                continuation.resume(
+                    returning: PageSectionMetrics(
+                        pageWidth: max(1, width),
+                        pageHeight: max(1, height),
+                        cropRect: CGRect(
+                            x: 0,
+                            y: max(0, startY),
+                            width: max(1, width),
+                            height: cropHeight
+                        )
+                    )
+                )
             }
         }
     }

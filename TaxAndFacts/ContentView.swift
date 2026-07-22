@@ -371,8 +371,7 @@ private struct HomeTabContainer: View {
         Task { @MainActor in
             defer { isSavingResultPage = false }
 
-            guard let snapshotImage = await resultPageCaptureController.captureSnapshotImage(),
-                  let screenshotData = snapshotImage.pngData() else {
+            guard let pdfData = await resultPageCaptureController.captureResultSectionPDFData() else {
                 captureAlert = CalculatorCaptureAlert.info(
                     title: "Unable to Save",
                     message: "The result page could not be captured. Please try again."
@@ -385,18 +384,19 @@ private struct HomeTabContainer: View {
 
                 switch format {
                 case .screenshot:
-                    let fileName = "TaxAndFacts-Result-\(UUID().uuidString).png"
-                    fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-                    try screenshotData.write(to: fileURL, options: .atomic)
-                case .pdf:
-                    guard let pdfData = resultPageCaptureController.pdfData(from: snapshotImage) else {
+                    guard let snapshotImage = resultPageCaptureController.renderImage(from: pdfData),
+                          let screenshotData = snapshotImage.pngData() else {
                         captureAlert = CalculatorCaptureAlert.info(
-                            title: "Unable to Create PDF",
-                            message: "The result page could not be converted into a PDF file."
+                            title: "Unable to Save",
+                            message: "The result page image could not be generated."
                         )
                         return
                     }
 
+                    let fileName = "TaxAndFacts-Result-\(UUID().uuidString).png"
+                    fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+                    try screenshotData.write(to: fileURL, options: .atomic)
+                case .pdf:
                     let fileName = "TaxAndFacts-Result-\(UUID().uuidString).pdf"
                     fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
                     try pdfData.write(to: fileURL, options: .atomic)
@@ -455,7 +455,7 @@ private struct HomeTabContainer: View {
         isRecognizingText = true
         lastW2ScanSource = source
 
-        Task {
+        Task.detached(priority: .userInitiated) {
             let recognizedItems = await TextRecognizer.recognizeTextItems(in: image)
             let recognizedText = recognizedItems
                 .map(\.text)
@@ -471,7 +471,7 @@ private struct HomeTabContainer: View {
                 "wages=\(extractedFields.wages ?? "nil")"
             )
 
-            await MainActor.run {
+            await MainActor.run { [recognizedText, extractedFields, captureText, source] in
                 if !hasWagesValue(extractedFields) {
                     captureAlert = CalculatorCaptureAlert(
                         title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
@@ -3072,14 +3072,20 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
             didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
         ) {
             if let image = info[.originalImage] as? UIImage {
-                parent.onImageCaptured(image)
+                picker.dismiss(animated: true) { [weak self] in
+                    guard let self else { return }
+
+                    DispatchQueue.main.async {
+                        self.parent.onImageCaptured(image)
+                    }
+                }
             } else {
-                parent.dismiss()
+                picker.dismiss(animated: true)
             }
         }
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            parent.dismiss()
+            picker.dismiss(animated: true)
         }
     }
 }
