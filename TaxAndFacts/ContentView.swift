@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 import WebKit
 import UserNotifications
 import PhotosUI
@@ -252,22 +253,14 @@ private struct HomeTabContainer: View {
                     isCalculatorStep2: $isCalculatorStep2,
                     isCalculatorStep4: $isCalculatorStep4,
                     resultPageCaptureController: resultPageCaptureController,
-                    onNavigationFinished: onNavigationFinished
+                    onNavigationFinished: onNavigationFinished,
+                    onShowCaptureOptions: showCaptureOptions
                 )
 
                 if AppConfiguration.isHelpURL(currentURLString) {
                     SavePageToggleButton(
                         isSaved: manager.isSaved(urlString: currentURLString),
                         action: toggleSavedPage
-                    )
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 18)
-                }
-
-                if AppConfiguration.isCalculatorURL(currentURLString), isCalculatorStep2 {
-                    CalculatorScanButton(
-                        isProcessing: isRecognizingText,
-                        action: showCaptureOptions
                     )
                     .padding(.trailing, 16)
                     .padding(.bottom, 18)
@@ -282,6 +275,7 @@ private struct HomeTabContainer: View {
                     .padding(.bottom, 18)
                     .zIndex(2)
                 }
+
             }
         }
         .sheet(isPresented: $isShowingCamera) {
@@ -295,7 +289,7 @@ private struct HomeTabContainer: View {
                 processCapturedImage(image, source: .photoLibrary)
             }
         }
-        .confirmationDialog("Scan W-2", isPresented: $isShowingCaptureOptions, titleVisibility: .visible) {
+        .alert("Scan W-2", isPresented: $isShowingCaptureOptions) {
             Button {
                 openCamera()
             } label: {
@@ -305,8 +299,23 @@ private struct HomeTabContainer: View {
             Button {
                 openPhotoLibrary()
             } label: {
-                Label("Upload from Gallery", systemImage: "photo.on.rectangle")
+                Label {
+                    Text("Upload from Gallery")
+                } icon: {
+                    ZStack {
+                        Circle()
+                            .fill(Color.orange)
+                        Image(systemName: "photo.fill.on.rectangle.fill")
+                            .font(.system(size: 6, weight: .bold))
+                            .foregroundStyle(.black)
+                    }
+                    .frame(width: 18, height: 18)
+                }
             }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Choose how you want to scan your W-2.")
         }
         .confirmationDialog("Save Result Page", isPresented: $isShowingResultSaveOptions, titleVisibility: .visible) {
             Button("Save as Screenshot") {
@@ -576,12 +585,14 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
     @Binding var isCalculatorStep4: Bool
     let resultPageCaptureController: ResultPageCaptureController
     let onNavigationFinished: (URL, Bool) -> Void
+    let onShowCaptureOptions: () -> Void
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorStepMessageName)
         configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorResultMessageName)
+        configuration.userContentController.add(context.coordinator, name: Coordinator.calculatorScanMessageName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -613,6 +624,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
 
         resultPageCaptureController.attach(webView: uiView)
         context.coordinator.installW2FieldPrefillSupport(into: uiView)
+        context.coordinator.installW2ScanTargetButton(into: uiView)
         context.coordinator.updateCalculatorResultState(in: uiView)
         DispatchQueue.main.async {
             context.coordinator.attemptW2FieldPrefill(in: uiView)
@@ -630,6 +642,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         static let calculatorStepMessageName = "calculatorStep"
         static let calculatorResultMessageName = "calculatorResult"
+        static let calculatorScanMessageName = "calculatorScan"
 
         var parent: NativeWebViewWrapper
         var loadedURL: URL?
@@ -660,6 +673,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
             updateCurrentImageURL(from: webView)
             injectNativeShellCSS(into: webView)
             updateCalculatorStepState(in: webView)
+            installW2ScanTargetButton(into: webView)
             updateCalculatorResultState(in: webView)
             installW2FieldPrefillSupport(into: webView)
             attemptW2FieldPrefill(in: webView)
@@ -707,6 +721,13 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     DispatchQueue.main.async { [weak self] in
                         self?.parent.isCalculatorStep4 = isResultPage
                     }
+                }
+                return
+            }
+
+            if message.name == Self.calculatorScanMessageName {
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.onShowCaptureOptions()
                 }
                 return
             }
@@ -1106,6 +1127,120 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                 reportResult();
                 window.setTimeout(reportResult, 250);
                 window.setTimeout(reportResult, 750);
+            })();
+            """#
+
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+
+        func installW2ScanTargetButton(into webView: WKWebView) {
+            let script = #"""
+            (function() {
+                function isVisible(element) {
+                    if (!element) { return false; }
+
+                    var style = window.getComputedStyle(element);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+                        return false;
+                    }
+
+                    var rects = element.getClientRects();
+                    return rects.length > 0 && rects[0].width > 0 && rects[0].height > 0;
+                }
+
+                function normalize(value) {
+                    return (value || '')
+                        .replace(/\s+/g, ' ')
+                        .trim()
+                        .toLowerCase();
+                }
+
+                function findHelpLabel() {
+                    var helpLabel = document.querySelector('#inn-tab1 .position-absolute .info-icon span.ml-1[style*="italic"]');
+                    if (helpLabel && isVisible(helpLabel) && normalize(helpLabel.textContent || '') === 'help') {
+                        return helpLabel;
+                    }
+
+                    return null;
+                }
+
+                function removeButton() {
+                    var existing = document.getElementById('taxfacts-w2-scan-target');
+                    if (existing && existing.parentNode) {
+                        existing.parentNode.removeChild(existing);
+                    }
+                }
+
+                function createButton(helpLabel) {
+                    var row = document.querySelector('#inn-tab1 .col-12.d-flex.align-items-center.position-relative');
+                    if (!row) {
+                        return;
+                    }
+
+                    var existing = document.getElementById('taxfacts-w2-scan-target');
+                    if (existing && existing.parentNode) {
+                        existing.parentNode.removeChild(existing);
+                    }
+
+                    var buttonHost = document.createElement('span');
+                    buttonHost.id = 'taxfacts-w2-scan-target';
+                    buttonHost.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;margin-top:24px;margin-right:6px;';
+                    buttonHost.innerHTML = '<button type="button" aria-label="Scan W-2" title="Scan W-2" style="appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:1px solid #000000;border-radius:50%;background:#000000;box-shadow:none;cursor:pointer;pointer-events:auto;vertical-align:middle;"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" style="width:14px;height:14px;display:block;fill:none;stroke:#ffffff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;"><path d="M12 4v10"></path><path d="M8.5 7.5L12 4l3.5 3.5"></path><path d="M5 14.5v3A2.5 2.5 0 0 0 7.5 20h9A2.5 2.5 0 0 0 19 17.5v-3"></path></svg></button>';
+
+                    var button = buttonHost.firstElementChild;
+                    button.addEventListener('click', function(event) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        try {
+                            window.webkit.messageHandlers.calculatorScan.postMessage(true);
+                        } catch (error) {}
+                    });
+
+                    row.insertBefore(buttonHost, row.firstChild);
+                }
+
+                function refreshButton() {
+                    if ((window.location.pathname || '').indexOf('/tax-calculator/') === -1) {
+                        removeButton();
+                        return;
+                    }
+
+                    var row = document.querySelector('#inn-tab1 .col-12.d-flex.align-items-center.position-relative');
+                    var helpLabel = findHelpLabel();
+                    if (!helpLabel || !row) {
+                        removeButton();
+                        return;
+                    }
+
+                    var existing = document.getElementById('taxfacts-w2-scan-target');
+                    if (existing && existing.parentNode === row && existing === row.firstChild) {
+                        return;
+                    }
+
+                    removeButton();
+                    createButton(helpLabel);
+                }
+
+                function scheduleRefresh() {
+                    window.clearTimeout(window.__taxFactsW2ScanTargetTimer);
+                    window.__taxFactsW2ScanTargetTimer = window.setTimeout(refreshButton, 80);
+                }
+
+                if (!window.__taxFactsW2ScanTargetInstalled) {
+                    window.__taxFactsW2ScanTargetInstalled = true;
+                    window.__taxFactsW2ScanTargetObserver = new MutationObserver(scheduleRefresh);
+                    window.__taxFactsW2ScanTargetObserver.observe(document.body || document.documentElement, {
+                        attributes: true,
+                        childList: true,
+                        subtree: true
+                    });
+
+                    ['input', 'change', 'hashchange', 'popstate'].forEach(function(eventName) {
+                        window.addEventListener(eventName, scheduleRefresh, true);
+                    });
+                }
+
+                refreshButton();
             })();
             """#
 
@@ -2973,22 +3108,6 @@ private struct SavePageToggleButton: View {
     }
 }
 
-private struct CalculatorScanButton: View {
-    let isProcessing: Bool
-    let action: () -> Void
-
-    var body: some View {
-        FloatingActionButton(
-            title: "Scan",
-            systemImage: "doc.viewfinder",
-            isProcessing: isProcessing,
-            processingLabel: "Extracting text",
-            restingLabel: "Scan W-2",
-            action: action
-        )
-    }
-}
-
 private struct ResultPageSaveButton: View {
     let isSaving: Bool
     let action: () -> Void
@@ -3045,48 +3164,243 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
     let onImageCaptured: (UIImage) -> Void
     @Environment(\.dismiss) private var dismiss
 
-    func makeUIViewController(context: Context) -> UIImagePickerController {
-        let picker = UIImagePickerController()
-        picker.sourceType = .camera
-        picker.cameraCaptureMode = .photo
-        picker.cameraDevice = .rear
-        picker.delegate = context.coordinator
-        return picker
+    func makeUIViewController(context: Context) -> CameraCaptureViewController {
+        CameraCaptureViewController(
+            onImageCaptured: { image in
+                onImageCaptured(image)
+                dismiss()
+            },
+            onCancel: {
+                dismiss()
+            }
+        )
     }
 
-    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+    func updateUIViewController(_ uiViewController: CameraCaptureViewController, context: Context) {}
+}
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
+private final class CameraCaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate {
+    private let onImageCaptured: (UIImage) -> Void
+    private let onCancel: () -> Void
+    private let session = AVCaptureSession()
+    private let sessionQueue = DispatchQueue(label: "TaxAndFacts.CameraSession")
+    private let photoOutput = AVCapturePhotoOutput()
+    private let previewView = CameraPreviewView()
+    private let captureButton = UIButton(type: .system)
+    private let cancelButton = UIButton(type: .system)
+    private let statusLabel = UILabel()
+    private var hasConfiguredSession = false
+    private var sessionRunning = false
+
+    init(onImageCaptured: @escaping (UIImage) -> Void, onCancel: @escaping () -> Void) {
+        self.onImageCaptured = onImageCaptured
+        self.onCancel = onCancel
+        super.init(nibName: nil, bundle: nil)
     }
 
-    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
-        let parent: CameraCaptureView
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
 
-        init(parent: CameraCaptureView) {
-            self.parent = parent
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        configureInterface()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        requestAccessIfNeeded()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        stopSession()
+    }
+
+    private func configureInterface() {
+        previewView.translatesAutoresizingMaskIntoConstraints = false
+        previewView.backgroundColor = .black
+        view.addSubview(previewView)
+
+        let controlsStack = UIStackView()
+        controlsStack.axis = .vertical
+        controlsStack.alignment = .center
+        controlsStack.spacing = 16
+        controlsStack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(controlsStack)
+
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.textAlignment = .center
+        statusLabel.numberOfLines = 0
+        statusLabel.textColor = .white
+        statusLabel.font = .preferredFont(forTextStyle: .footnote)
+        statusLabel.text = "Preparing camera..."
+
+        captureButton.translatesAutoresizingMaskIntoConstraints = false
+        captureButton.setImage(UIImage(systemName: "circle.inset.filled"), for: .normal)
+        captureButton.tintColor = .white
+        captureButton.backgroundColor = .clear
+        captureButton.contentEdgeInsets = .zero
+        captureButton.addTarget(self, action: #selector(capturePhoto), for: .touchUpInside)
+
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.setTitle("Cancel", for: .normal)
+        cancelButton.setTitleColor(.white, for: .normal)
+        cancelButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
+        cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+
+        controlsStack.addArrangedSubview(statusLabel)
+        controlsStack.addArrangedSubview(captureButton)
+        controlsStack.addArrangedSubview(cancelButton)
+
+        NSLayoutConstraint.activate([
+            previewView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            previewView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            previewView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            previewView.heightAnchor.constraint(equalTo: previewView.widthAnchor, multiplier: 9.0 / 16.0),
+
+            controlsStack.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 24),
+            controlsStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            controlsStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
+            controlsStack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
+            controlsStack.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+
+            captureButton.widthAnchor.constraint(equalToConstant: 76),
+            captureButton.heightAnchor.constraint(equalToConstant: 76)
+        ])
+
+        if let previewLayer = previewView.previewLayer {
+            previewLayer.videoGravity = .resizeAspectFill
         }
+    }
 
-        func imagePickerController(
-            _ picker: UIImagePickerController,
-            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
-        ) {
-            if let image = info[.originalImage] as? UIImage {
-                picker.dismiss(animated: true) { [weak self] in
+    private func requestAccessIfNeeded() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configureSessionIfNeeded()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
                     guard let self else { return }
-
-                    DispatchQueue.main.async {
-                        self.parent.onImageCaptured(image)
+                    if granted {
+                        self.configureSessionIfNeeded()
+                    } else {
+                        self.statusLabel.text = "Camera access is required."
+                        self.cancelButton.setTitle("Close", for: .normal)
                     }
                 }
-            } else {
-                picker.dismiss(animated: true)
             }
+        case .denied, .restricted:
+            statusLabel.text = "Camera access is required."
+            cancelButton.setTitle("Close", for: .normal)
+        @unknown default:
+            statusLabel.text = "Camera unavailable."
+        }
+    }
+
+    private func configureSessionIfNeeded() {
+        guard !hasConfiguredSession else {
+            startSession()
+            return
         }
 
-        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
-            picker.dismiss(animated: true)
+        hasConfiguredSession = true
+        statusLabel.text = "Position the W-2 inside the frame."
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+
+            self.session.beginConfiguration()
+            if self.session.canSetSessionPreset(.hd1920x1080) {
+                self.session.sessionPreset = .hd1920x1080
+            } else if self.session.canSetSessionPreset(.hd1280x720) {
+                self.session.sessionPreset = .hd1280x720
+            } else if self.session.canSetSessionPreset(.photo) {
+                self.session.sessionPreset = .photo
+            }
+
+            guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                  let input = try? AVCaptureDeviceInput(device: camera),
+                  self.session.canAddInput(input) else {
+                self.session.commitConfiguration()
+                DispatchQueue.main.async {
+                    self.statusLabel.text = "Unable to start camera."
+                    self.cancelButton.setTitle("Close", for: .normal)
+                }
+                return
+            }
+
+            if self.session.canAddOutput(self.photoOutput) {
+                self.session.addOutput(self.photoOutput)
+            }
+
+            if self.session.canAddInput(input) {
+                self.session.addInput(input)
+            }
+
+            self.photoOutput.isHighResolutionCaptureEnabled = true
+            self.session.commitConfiguration()
+
+            DispatchQueue.main.async {
+                self.previewView.setSession(self.session)
+                self.startSession()
+            }
         }
+    }
+
+    private func startSession() {
+        sessionQueue.async { [weak self] in
+            guard let self, !self.sessionRunning else { return }
+            self.session.startRunning()
+            self.sessionRunning = true
+        }
+    }
+
+    private func stopSession() {
+        sessionQueue.async { [weak self] in
+            guard let self, self.sessionRunning else { return }
+            self.session.stopRunning()
+            self.sessionRunning = false
+        }
+    }
+
+    @objc private func capturePhoto() {
+        let settings = AVCapturePhotoSettings()
+        if photoOutput.supportedFlashModes.contains(.off) {
+            settings.flashMode = .off
+        }
+        settings.isHighResolutionPhotoEnabled = true
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    @objc private func cancelTapped() {
+        onCancel()
+    }
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        guard error == nil,
+              let data = photo.fileDataRepresentation(),
+              let image = UIImage(data: data) else {
+            return
+        }
+
+        onImageCaptured(image)
+    }
+}
+
+private final class CameraPreviewView: UIView {
+    override class var layerClass: AnyClass {
+        AVCaptureVideoPreviewLayer.self
+    }
+
+    var previewLayer: AVCaptureVideoPreviewLayer? {
+        layer as? AVCaptureVideoPreviewLayer
+    }
+
+    func setSession(_ session: AVCaptureSession) {
+        previewLayer?.session = session
     }
 }
 
