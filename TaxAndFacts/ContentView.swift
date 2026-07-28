@@ -1,9 +1,11 @@
 import SwiftUI
 import UIKit
 import AVFoundation
+import Photos
 import WebKit
 import UserNotifications
 import PhotosUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var readLaterManager = ReadLaterManager()
@@ -37,7 +39,14 @@ struct ContentView: View {
                     )
                 case .savedArticle:
                     if let selectedSavedArticle {
-                        SavedArticleDetailView(article: selectedSavedArticle)
+                        SavedArticleDetailView(
+                            article: selectedSavedArticle,
+                            isOffline: isOffline,
+                            onClose: {
+                                self.selectedSavedArticle = nil
+                                self.selectedScreen = .saved
+                            }
+                        )
                     }
                 }
             }
@@ -190,6 +199,16 @@ private struct HomeTabContainer: View {
         case photoLibrary
     }
 
+    private struct UploadSuccessState: Identifiable {
+        let id = UUID()
+        let documentNumber: Int
+    }
+
+    private struct SuccessToastState: Identifiable {
+        let id = UUID()
+        let message: String
+    }
+
     let manager: ReadLaterManager
     @Binding var url: URL
     @Binding var isOffline: Bool
@@ -209,19 +228,22 @@ private struct HomeTabContainer: View {
     @State private var isRecognizingText = false
     @State private var isCalculatorStep2 = false
     @State private var isCalculatorStep4 = false
+    @State private var uploadSuccessState: UploadSuccessState?
     @State private var captureAlert: CalculatorCaptureAlert?
     @State private var lastW2ScanSource: W2ScanSource = .camera
     @State private var shouldPopulateQueuedW2Documents = false
     @State private var resultPageCaptureController = ResultPageCaptureController()
     @State private var isShowingResultSaveOptions = false
-    @State private var isShowingResultShareSheet = false
-    @State private var resultShareURL: URL?
+    @State private var isShowingPDFExportPicker = false
+    @State private var pdfExportURL: URL?
     @State private var isSavingResultPage = false
+    @State private var successToastState: SuccessToastState?
 
     private enum ResultPageSaveFormat {
         case screenshot
         case pdf
     }
+    
 
     private var shouldShowResultSaveButton: Bool {
         guard AppConfiguration.isCalculatorURL(currentURLString) else { return false }
@@ -233,9 +255,9 @@ private struct HomeTabContainer: View {
         ZStack(alignment: .bottomTrailing) {
             if isOffline {
                 ContentUnavailableView(
-                    "You are Offline",
+                    "🌐 You are currently offline. Accessing saved articles only.",
                     systemImage: "wifi.slash",
-                    description: Text("You can still review saved Tax & Facts references from the Saved tab.")
+                    description: Text("")
                 )
             } else {
                 NativeWebViewWrapper(
@@ -254,6 +276,7 @@ private struct HomeTabContainer: View {
                     isCalculatorStep4: $isCalculatorStep4,
                     resultPageCaptureController: resultPageCaptureController,
                     onNavigationFinished: onNavigationFinished,
+                    onW2PopulationSuccess: { showSuccessToast(message: "Success! Your tax form has been updated with your uploaded W-2 data.") },
                     onShowCaptureOptions: showCaptureOptions
                 )
 
@@ -281,56 +304,72 @@ private struct HomeTabContainer: View {
         .sheet(isPresented: $isShowingCamera) {
             CameraCaptureView { image in
                 processCapturedImage(image, source: .camera)
+            } onPermissionDenied: {
+                captureAlert = CalculatorCaptureAlert(
+                    title: "Camera Access Denied",
+                    message: "To scan your W-2, please enable camera access in your iPhone's system settings.",
+                    kind: .cameraAccessDenied
+                )
             }
                 .ignoresSafeArea()
         }
-        .sheet(isPresented: $isShowingPhotoLibrary) {
-            PhotoLibraryCaptureView { image in
-                processCapturedImage(image, source: .photoLibrary)
+        .fileImporter(
+            isPresented: $isShowingPhotoLibrary,
+            allowedContentTypes: [.image, .pdf],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                importSelectedFile(from: url)
+            case .failure:
+                captureAlert = CalculatorCaptureAlert.info(
+                    title: "Unable to Open File",
+                    message: "The selected file could not be imported. Please try again."
+                )
             }
         }
-        .alert("Scan W-2", isPresented: $isShowingCaptureOptions) {
-            Button {
-                openCamera()
-            } label: {
-                Label("Scanner", systemImage: "camera.fill")
-            }
+        .background(
+            NativeCenteredAlertPresenter(isPresented: $isShowingResultSaveOptions) { dismiss in
+                let alert = UIAlertController(
+                    title: "Save your tax outcome",
+                    message: "Choose how you would like to export your final calculation summary.",
+                    preferredStyle: .alert
+                )
 
-            Button {
-                openPhotoLibrary()
-            } label: {
-                Label {
-                    Text("Upload from Gallery")
-                } icon: {
-                    ZStack {
-                        Circle()
-                            .fill(Color.orange)
-                        Image(systemName: "photo.fill.on.rectangle.fill")
-                            .font(.system(size: 6, weight: .bold))
-                            .foregroundStyle(.black)
-                    }
-                    .frame(width: 18, height: 18)
-                }
-            }
+                alert.addAction(UIAlertAction(title: "Save as PDF document", style: .default) { _ in
+                    dismiss()
+                    saveCurrentResultPage(as: .pdf)
+                })
 
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Choose how you want to scan your W-2.")
-        }
-        .confirmationDialog("Save Result Page", isPresented: $isShowingResultSaveOptions, titleVisibility: .visible) {
-            Button("Save as Screenshot") {
-                saveCurrentResultPage(as: .screenshot)
-            }
+                alert.addAction(UIAlertAction(title: "Save to Photos image", style: .default) { _ in
+                    dismiss()
+                    saveCurrentResultPage(as: .screenshot)
+                })
 
-            Button("Save as PDF") {
-                saveCurrentResultPage(as: .pdf)
+                alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alert
             }
-        }
-        .sheet(isPresented: $isShowingResultShareSheet, onDismiss: {
-            resultShareURL = nil
+        )
+        .sheet(isPresented: $isShowingPDFExportPicker, onDismiss: {
+            self.pdfExportURL = nil
         }) {
-            if let resultShareURL {
-                ActivityView(activityItems: [resultShareURL])
+            if let exportURL = pdfExportURL {
+                PDFExportPicker(
+                    fileURL: exportURL,
+                    onExportCompleted: {
+                        self.isShowingPDFExportPicker = false
+                        self.pdfExportURL = nil
+                        showSuccessToast(message: "PDF saved successfully to your files!")
+                    },
+                    onCancel: {
+                        self.isShowingPDFExportPicker = false
+                        self.pdfExportURL = nil
+                    }
+                )
             }
         }
         .alert(item: $captureAlert) { alert in
@@ -348,6 +387,106 @@ private struct HomeTabContainer: View {
                     primaryButton: .default(Text("Yes"), action: reopenLastScanSource),
                     secondaryButton: .cancel(Text("Done Scanning"), action: beginW2Population)
                 )
+            case .documentNotRecognized:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Upload again"), action: reopenLastScanSource),
+                    secondaryButton: .cancel(Text("Enter manually [1]"), action: enterW2Manually)
+                )
+            case .cameraAccessDenied:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Go to Settings"), action: openAppSettings),
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            case .photosAccessDenied:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Go to Settings"), action: openAppSettings),
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            }
+        }
+        .background(
+            NativeCenteredAlertPresenter(isPresented: $isShowingCaptureOptions) { dismiss in
+                let alert = UIAlertController(
+                    title: "Upload W-2",
+                    message: "Choose how you want to add your W-2.",
+                    preferredStyle: .alert
+                )
+
+                alert.addAction(UIAlertAction(title: "Take a photo", style: .default) { _ in
+                    dismiss()
+                    openCamera()
+                })
+
+                alert.addAction(UIAlertAction(title: "Upload file or photo", style: .default) { _ in
+                    dismiss()
+                    openPhotoLibrary()
+                })
+
+                alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alert
+            }
+        )
+        .background(
+            NativeCenteredAlertPresenter(isPresented: Binding(
+                get: { uploadSuccessState != nil },
+                set: { newValue in
+                    if !newValue {
+                        uploadSuccessState = nil
+                    }
+                }
+            )) { dismiss in
+                let documentNumber = uploadSuccessState?.documentNumber ?? 1
+                let alert = UIAlertController(
+                    title: "W-2 added successfully!",
+                    message: "Your file is attached as W-2 #\(documentNumber). What would you like to do next?",
+                    preferredStyle: .alert
+                )
+
+                alert.addAction(UIAlertAction(title: "Finish & calculate tax", style: .default) { _ in
+                    dismiss()
+                    finishAndCalculateTax()
+                })
+
+                alert.addAction(UIAlertAction(title: "Add another W-2", style: .default) { _ in
+                    dismiss()
+                    addAnotherW2()
+                })
+
+                alert.addAction(UIAlertAction(title: "Remove this file", style: .destructive) { _ in
+                    dismiss()
+                    removeUploadedW2()
+                })
+
+                alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alert
+            }
+        )
+        .overlay {
+            if isRecognizingText {
+                processingOverlay
+                    .transition(.opacity)
+                    .zIndex(7)
+            }
+        }
+        .overlay(alignment: .top) {
+            if let successToastState {
+                successToastView(for: successToastState)
+                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .zIndex(6)
             }
         }
     }
@@ -360,6 +499,210 @@ private struct HomeTabContainer: View {
         isShowingResultSaveOptions = true
     }
 
+    private func showSuccessToast(message: String) {
+        let toast = SuccessToastState(message: message)
+        withAnimation(.easeInOut(duration: 0.25)) {
+            successToastState = toast
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard successToastState?.id == toast.id else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                successToastState = nil
+            }
+        }
+    }
+
+    private func openAppSettings() {
+        guard let settingsURL = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(settingsURL)
+    }
+
+    private struct NativeCenteredAlertPresenter: UIViewControllerRepresentable {
+        @Binding var isPresented: Bool
+        let makeAlert: (_ dismiss: @escaping () -> Void) -> UIAlertController
+
+        func makeUIViewController(context: Context) -> UIViewController {
+            UIViewController()
+        }
+
+        func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+            if isPresented {
+                guard !context.coordinator.isPresenting else { return }
+                context.coordinator.isPresenting = true
+
+                let dismiss = {
+                    isPresented = false
+                }
+
+                let alertController = makeAlert(dismiss)
+                context.coordinator.presentedAlert = alertController
+                DispatchQueue.main.async {
+                    uiViewController.present(alertController, animated: true)
+                }
+            } else if context.coordinator.isPresenting {
+                context.coordinator.isPresenting = false
+                context.coordinator.presentedAlert?.dismiss(animated: true)
+                context.coordinator.presentedAlert = nil
+            }
+        }
+
+        func makeCoordinator() -> Coordinator {
+            Coordinator()
+        }
+
+        final class Coordinator {
+            var isPresenting = false
+            weak var presentedAlert: UIViewController?
+        }
+    }
+
+    private func successToastView(for state: SuccessToastState) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(.green)
+
+            Text(state.message)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(.separator.opacity(0.18), lineWidth: 0.8)
+        )
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
+    }
+
+
+    private static func importedImage(from url: URL) -> UIImage? {
+        let fileExtension = url.pathExtension.lowercased()
+
+        if fileExtension == "pdf",
+           let pdfData = try? Data(contentsOf: url),
+           let provider = CGDataProvider(data: pdfData as CFData),
+           let pdfDocument = CGPDFDocument(provider),
+           let page = pdfDocument.page(at: 1) {
+            let pageRect = page.getBoxRect(.mediaBox)
+            guard pageRect.width > 0, pageRect.height > 0 else { return nil }
+
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = 1
+            format.opaque = true
+
+            let renderer = UIGraphicsImageRenderer(size: pageRect.size, format: format)
+            return renderer.image { context in
+                UIColor.systemBackground.setFill()
+                context.fill(CGRect(origin: .zero, size: pageRect.size))
+
+                let cgContext = context.cgContext
+                cgContext.saveGState()
+                cgContext.translateBy(x: 0, y: pageRect.height)
+                cgContext.scaleBy(x: 1, y: -1)
+                cgContext.interpolationQuality = .high
+                cgContext.drawPDFPage(page)
+                cgContext.restoreGState()
+            }
+        }
+
+        if let image = UIImage(contentsOfFile: url.path) {
+            return image
+        }
+
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return UIImage(data: data)
+    }
+
+    private var processingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.24)
+                .ignoresSafeArea()
+
+            VStack(spacing: 12) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .controlSize(.large)
+
+                Text("Processing W-2")
+                    .font(.headline.weight(.semibold))
+
+                Text("Extracting your W-2 data and updating your tax form... Please hold on a moment.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private func uploadSuccessOverlay(for state: UploadSuccessState) -> some View {
+        ZStack {
+            Color.black.opacity(0.28)
+                .ignoresSafeArea()
+
+            VStack(alignment: .center, spacing: 16) {
+                Text("W-2 added successfully!")
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+
+                Text("Your file is attached as W-2 #\(state.documentNumber). What would you like to do next?")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                VStack(spacing: 12) {
+                    Button(action: finishAndCalculateTax) {
+                        Text("Finish & calculate tax")
+                            .font(.headline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .foregroundStyle(.white)
+                            .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: addAnotherW2) {
+                        Text("Add another W-2")
+                            .font(.headline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .foregroundStyle(.primary)
+                            .background(.background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .stroke(.separator, lineWidth: 0.8)
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: removeUploadedW2) {
+                        Text("Remove this file")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.blue)
+                            .underline()
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 4)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: 360)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .shadow(color: .black.opacity(0.2), radius: 22, y: 8)
+            .padding(.horizontal, 20)
+        }
+    }
+
     private func toggleSavedPage() {
         if manager.isSaved(urlString: currentURLString) {
             manager.deleteArticle(urlString: currentURLString)
@@ -370,6 +713,7 @@ private struct HomeTabContainer: View {
                 htmlString: currentHTMLString,
                 imageURLString: currentImageURLString
             )
+            showSuccessToast(message: "Article saved! You can now read this without an internet connection.")
         }
     }
 
@@ -389,12 +733,10 @@ private struct HomeTabContainer: View {
             }
 
             do {
-                let fileURL: URL
-
                 switch format {
                 case .screenshot:
                     guard let snapshotImage = resultPageCaptureController.renderImage(from: pdfData),
-                          let screenshotData = snapshotImage.pngData() else {
+                          snapshotImage.cgImage != nil else {
                         captureAlert = CalculatorCaptureAlert.info(
                             title: "Unable to Save",
                             message: "The result page image could not be generated."
@@ -402,17 +744,15 @@ private struct HomeTabContainer: View {
                         return
                     }
 
-                    let fileName = "TaxAndFacts-Result-\(UUID().uuidString).png"
-                    fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
-                    try screenshotData.write(to: fileURL, options: .atomic)
+                    saveResultScreenshotToPhotos(snapshotImage)
                 case .pdf:
+                    let fileURL: URL
                     let fileName = "TaxAndFacts-Result-\(UUID().uuidString).pdf"
                     fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
                     try pdfData.write(to: fileURL, options: .atomic)
+                    pdfExportURL = fileURL
+                    isShowingPDFExportPicker = true
                 }
-
-                resultShareURL = fileURL
-                isShowingResultShareSheet = true
             } catch {
                 let message: String
                 switch format {
@@ -427,6 +767,55 @@ private struct HomeTabContainer: View {
                     message: message
                 )
             }
+        }
+    }
+
+    private func saveResultScreenshotToPhotos(_ image: UIImage) {
+        let saveChanges = {
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }, completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        self.showSuccessToast(message: "Image saved successfully to your photo library!")
+                    } else {
+                        let message = error?.localizedDescription ?? "The image could not be saved to your photo library."
+                        self.captureAlert = CalculatorCaptureAlert(
+                            title: "Photos Access Denied",
+                            message: message.isEmpty
+                                ? "We need permission to save the image to your gallery. Please enable photo access in your iPhone's system settings."
+                                : "We need permission to save the image to your gallery. Please enable photo access in your iPhone's system settings.",
+                            kind: .photosAccessDenied
+                        )
+                    }
+                }
+            })
+        }
+
+        switch PHPhotoLibrary.authorizationStatus(for: .addOnly) {
+        case .authorized, .limited:
+            saveChanges()
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                switch status {
+                case .authorized, .limited:
+                    saveChanges()
+                default:
+                    DispatchQueue.main.async {
+                        self.captureAlert = CalculatorCaptureAlert(
+                            title: "Photos Access Denied",
+                            message: "We need permission to save the image to your gallery. Please enable photo access in your iPhone's system settings.",
+                            kind: .photosAccessDenied
+                        )
+                    }
+                }
+            }
+        default:
+            captureAlert = CalculatorCaptureAlert(
+                title: "Photos Access Denied",
+                message: "We need permission to save the image to your gallery. Please enable photo access in your iPhone's system settings.",
+                kind: .photosAccessDenied
+            )
         }
     }
 
@@ -480,12 +869,12 @@ private struct HomeTabContainer: View {
                 "wages=\(extractedFields.wages ?? "nil")"
             )
 
-            await MainActor.run { [recognizedText, extractedFields, captureText, source] in
+            await MainActor.run { [recognizedText, extractedFields, captureText] in
                 if !hasWagesValue(extractedFields) {
                     captureAlert = CalculatorCaptureAlert(
                         title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
                         message: captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields),
-                        kind: .info
+                        kind: .documentNotRecognized
                     )
                 } else if extractedFields.hasAnyValue {
                     captureManager.saveCapture(
@@ -494,15 +883,7 @@ private struct HomeTabContainer: View {
                         recognizedText: captureText
                     )
                     pendingW2Documents.append(extractedFields)
-
-                    if AppConfiguration.isCalculatorURL(currentURLString), isCalculatorStep2 {
-                        captureAlert = CalculatorCaptureAlert.scanDecision(
-                            documentNumber: pendingW2Documents.count,
-                            isCameraCapture: source == .camera
-                        )
-                    } else {
-                        beginW2Population()
-                    }
+                    uploadSuccessState = UploadSuccessState(documentNumber: pendingW2Documents.count)
                 } else {
                     captureAlert = CalculatorCaptureAlert(
                         title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
@@ -516,20 +897,74 @@ private struct HomeTabContainer: View {
         }
     }
 
+    private func importSelectedFile(from url: URL) {
+        isRecognizingText = true
+        lastW2ScanSource = .photoLibrary
+
+        Task.detached(priority: .userInitiated) { [url] in
+            let didStartAccessing = url.startAccessingSecurityScopedResource()
+            defer {
+                if didStartAccessing {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            guard let image = Self.importedImage(from: url) else {
+                await MainActor.run {
+                    self.isRecognizingText = false
+                    self.captureAlert = CalculatorCaptureAlert.info(
+                        title: "Unable to Import",
+                        message: "The selected file could not be read as an image or PDF."
+                    )
+                }
+                return
+            }
+
+            await MainActor.run {
+                self.processCapturedImage(image, source: .photoLibrary)
+            }
+        }
+    }
+
     private func beginW2Population() {
         guard !pendingW2Documents.isEmpty else { return }
 
         shouldPopulateQueuedW2Documents = true
         w2PopulateRequestID += 1
+        uploadSuccessState = nil
+    }
+
+    private func finishAndCalculateTax() {
+        uploadSuccessState = nil
+        beginW2Population()
+    }
+
+    private func addAnotherW2() {
+        uploadSuccessState = nil
+        showCaptureOptions()
+    }
+
+    private func enterW2Manually() {
+        uploadSuccessState = nil
+    }
+
+    private func removeUploadedW2() {
+        guard !pendingW2Documents.isEmpty else {
+            uploadSuccessState = nil
+            return
+        }
+
+        pendingW2Documents.removeLast()
+        uploadSuccessState = nil
     }
 
     private func captureAlertTitle(recognizedText: String, extractedFields: W2ExtractedFields) -> String {
         if recognizedText.isEmpty {
-            return "No Text Found"
+            return "Unclear image"
         }
 
         if !hasWagesValue(extractedFields) {
-            return "No Wages Found"
+            return "Document not recognized"
         }
 
         return extractedFields.hasAnyValue ? "W-2 Fields Saved" : "No W-2 Fields Found"
@@ -537,11 +972,11 @@ private struct HomeTabContainer: View {
 
     private func captureAlertMessage(recognizedText: String, extractedFields: W2ExtractedFields) -> String {
         if recognizedText.isEmpty {
-            return "No readable text was detected."
+            return "We couldn't read the text on your W-2. Please try again with a clearer photo or upload a digital PDF."
         }
 
         if !hasWagesValue(extractedFields) {
-            return "No wages value was found in this W-2. Please retake the photo with Box 1 clearly visible."
+            return "We couldn't find a valid W-2 form in this file. Please make sure you are uploading an official W-2 tax document."
         }
 
         if !extractedFields.hasAnyValue {
@@ -569,7 +1004,7 @@ private struct HomeTabContainer: View {
     }
 }
 
-private struct NativeWebViewWrapper: UIViewRepresentable {
+    private struct NativeWebViewWrapper: UIViewRepresentable {
     @Binding var url: URL
     @Binding var isOffline: Bool
     @Binding var currentTitle: String
@@ -585,6 +1020,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
     @Binding var isCalculatorStep4: Bool
     let resultPageCaptureController: ResultPageCaptureController
     let onNavigationFinished: (URL, Bool) -> Void
+    let onW2PopulationSuccess: () -> Void
     let onShowCaptureOptions: () -> Void
 
     func makeUIView(context: Context) -> WKWebView {
@@ -2785,6 +3221,7 @@ private struct NativeWebViewWrapper: UIViewRepresentable {
                     self.parent.shouldPopulateQueuedW2Documents = false
                     self.submittedW2PopulateRequestID = -1
                     self.stopW2PrefillRetryLoop()
+                    self.parent.onW2PopulationSuccess()
                 }
             }
         }
@@ -2921,6 +3358,7 @@ private struct SavedContentView: View {
     let manager: ReadLaterManager
     let isOffline: Bool
     let onOpen: (SavedArticle) -> Void
+    @State private var pendingRemovalArticle: SavedArticle?
 
     var body: some View {
         NavigationStack {
@@ -2941,7 +3379,7 @@ private struct SavedContentView: View {
                                     set: { manager.setArticle(article, isRead: $0) }
                                 ),
                                 onOpen: { onOpen(article) },
-                                onDelete: { manager.deleteArticle(id: article.id) }
+                                onDelete: { pendingRemovalArticle = article }
                             )
                         }
                         .onDelete(perform: manager.deleteArticles)
@@ -2950,6 +3388,16 @@ private struct SavedContentView: View {
                 }
             }
             .navigationTitle(isOffline ? "Offline Saved" : "Saved Content")
+            .alert(item: $pendingRemovalArticle) { article in
+                Alert(
+                    title: Text("Remove from offline?"),
+                    message: Text("This article will no longer be available to read without internet access."),
+                    primaryButton: .destructive(Text("Remove"), action: {
+                        manager.deleteArticle(id: article.id)
+                    }),
+                    secondaryButton: .cancel(Text("Keep"))
+                )
+            }
         }
     }
 }
@@ -3092,7 +3540,7 @@ private struct SavePageToggleButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label(isSaved ? "Saved" : "Save", systemImage: isSaved ? "bookmark.fill" : "bookmark")
+            Label(isSaved ? "Saved offline" : "Save for offline", systemImage: isSaved ? "bookmark.fill" : "bookmark")
                 .font(.headline)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -3162,6 +3610,7 @@ private struct FloatingActionButton: View {
 
 private struct CameraCaptureView: UIViewControllerRepresentable {
     let onImageCaptured: (UIImage) -> Void
+    let onPermissionDenied: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     func makeUIViewController(context: Context) -> CameraCaptureViewController {
@@ -3169,6 +3618,10 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
             onImageCaptured: { image in
                 onImageCaptured(image)
                 dismiss()
+            },
+            onPermissionDenied: {
+                dismiss()
+                onPermissionDenied()
             },
             onCancel: {
                 dismiss()
@@ -3179,8 +3632,50 @@ private struct CameraCaptureView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: CameraCaptureViewController, context: Context) {}
 }
 
+private struct PDFExportPicker: UIViewControllerRepresentable {
+    let fileURL: URL
+    let onExportCompleted: () -> Void
+    let onCancel: () -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forExporting: [fileURL], asCopy: true)
+        picker.delegate = context.coordinator
+        picker.modalPresentationStyle = .formSheet
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onExportCompleted: onExportCompleted, onCancel: onCancel)
+    }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onExportCompleted: () -> Void
+        let onCancel: () -> Void
+
+        init(onExportCompleted: @escaping () -> Void, onCancel: @escaping () -> Void) {
+            self.onExportCompleted = onExportCompleted
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            DispatchQueue.main.async {
+                self.onExportCompleted()
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            DispatchQueue.main.async {
+                self.onCancel()
+            }
+        }
+    }
+}
+
 private final class CameraCaptureViewController: UIViewController, AVCapturePhotoCaptureDelegate {
     private let onImageCaptured: (UIImage) -> Void
+    private let onPermissionDenied: () -> Void
     private let onCancel: () -> Void
     private let session = AVCaptureSession()
     private let sessionQueue = DispatchQueue(label: "TaxAndFacts.CameraSession")
@@ -3192,8 +3687,13 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
     private var hasConfiguredSession = false
     private var sessionRunning = false
 
-    init(onImageCaptured: @escaping (UIImage) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        onImageCaptured: @escaping (UIImage) -> Void,
+        onPermissionDenied: @escaping () -> Void,
+        onCancel: @escaping () -> Void
+    ) {
         self.onImageCaptured = onImageCaptured
+        self.onPermissionDenied = onPermissionDenied
         self.onCancel = onCancel
         super.init(nibName: nil, bundle: nil)
     }
@@ -3289,12 +3789,14 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
                     } else {
                         self.statusLabel.text = "Camera access is required."
                         self.cancelButton.setTitle("Close", for: .normal)
+                        self.onPermissionDenied()
                     }
                 }
             }
         case .denied, .restricted:
             statusLabel.text = "Camera access is required."
             cancelButton.setTitle("Close", for: .normal)
+            onPermissionDenied()
         @unknown default:
             statusLabel.text = "Camera unavailable."
         }
@@ -4152,17 +4654,45 @@ private enum W2FieldExtractor {
 
 private struct SavedArticleDetailView: View {
     let article: SavedArticle
+    let isOffline: Bool
+    let onClose: () -> Void
 
     var body: some View {
         Group {
             if article.htmlString.isEmpty {
-                ContentUnavailableView(
-                    "Saved Page Unavailable",
-                    systemImage: "doc.questionmark",
-                    description: Text("This saved item does not include an offline page snapshot.")
-                )
+                VStack(spacing: 16) {
+                    ContentUnavailableView(
+                        "No internet connection",
+                        systemImage: "wifi.slash",
+                        description: Text("This article hasn't been saved for offline reading. Please connect to the internet to view it.")
+                    )
+
+                    Button("Close", action: onClose)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        .background(Color.accentColor, in: Capsule())
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding()
             } else {
-                OfflineHTMLView(htmlString: article.htmlString, baseURLString: article.urlString)
+                ZStack(alignment: .top) {
+                    OfflineHTMLView(htmlString: article.htmlString, baseURLString: article.urlString)
+
+                    if isOffline {
+                        HStack(spacing: 8) {
+                            Image(systemName: "folder.fill")
+                            Text("Reading offline")
+                        }
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.78), in: Capsule())
+                        .padding(.top, 12)
+                    }
+                }
             }
         }
     }
@@ -4492,7 +5022,7 @@ private struct AppNavigationBar: View {
                 .disabled(!canGoBack)
                 .opacity(canGoBack ? 1 : 0.4)
             navigationButton(title: "Home", systemImage: "house", action: onHome)
-            navigationButton(title: "Saved", systemImage: "bookmark", action: onSaved)
+            navigationButton(title: "Saved offline", systemImage: "bookmark", action: onSaved)
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)

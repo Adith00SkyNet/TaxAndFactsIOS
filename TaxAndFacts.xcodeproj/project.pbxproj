@@ -10,9 +10,22 @@
 		B9D63F9D2FF2681100377408 /* TaxAndFacts.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TaxAndFacts.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		B922B85C30178682005C6F73 /* Exceptions for "TaxAndFacts" folder in "TaxAndFacts" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = B9D63F9C2FF2681100377408 /* TaxAndFacts */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		B9D63F9F2FF2681100377408 /* TaxAndFacts */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				B922B85C30178682005C6F73 /* Exceptions for "TaxAndFacts" folder in "TaxAndFacts" target */,
+			);
 			path = TaxAndFacts;
 			sourceTree = "<group>";
 		};
@@ -295,8 +308,10 @@
 				DEVELOPMENT_TEAM = J3SSRK26KV;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = TaxAndFacts/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Tax & Facts needs camera access to scan W-2 forms";
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app requires camera access to scan and automatically extract tax information from your physical W-2 forms.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app requires access to your photo library so you can select and upload saved images or PDFs of your W-2 forms.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -330,8 +345,10 @@
 				DEVELOPMENT_TEAM = J3SSRK26KV;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = TaxAndFacts/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.finance";
-				INFOPLIST_KEY_NSCameraUsageDescription = "Tax & Facts needs camera access to scan W-2 forms";
+				INFOPLIST_KEY_NSCameraUsageDescription = "This app requires camera access to scan and automatically extract tax information from your physical W-2 forms.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "This app requires access to your photo library so you can select and upload saved images or PDFs of your W-2 forms.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

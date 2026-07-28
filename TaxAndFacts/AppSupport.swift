@@ -60,6 +60,9 @@ struct CalculatorCaptureAlert: Identifiable {
     enum Kind {
         case info
         case scanDecision
+        case documentNotRecognized
+        case cameraAccessDenied
+        case photosAccessDenied
     }
 
     let id = UUID()
@@ -151,7 +154,9 @@ final class CalculatorCaptureManager {
 final class ReadLaterManager {
     private(set) var articles: [SavedArticle] = []
 
+    private let legacyStorageKey = "read_later_articles"
     private let storageKey = "read_later_articles"
+    private let storageFileName = "read_later_articles.json"
     private let expirationInterval: TimeInterval = 15 * 24 * 60 * 60
     private let expirationWarningInterval: TimeInterval = 14 * 24 * 60 * 60
 
@@ -338,17 +343,45 @@ final class ReadLaterManager {
 
     private func saveToDisk() {
         if let encoded = try? JSONEncoder().encode(articles) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
+            do {
+                let fileURL = try storageURL()
+                try encoded.write(to: fileURL, options: .atomic)
+            } catch {
+                return
+            }
         }
     }
 
     private func loadArticles() {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
+        if let data = try? Data(contentsOf: storageURL()),
+           let decoded = try? JSONDecoder().decode([SavedArticle].self, from: data) {
+            articles = decoded
+            return
+        }
+
+        guard let data = UserDefaults.standard.data(forKey: legacyStorageKey),
               let decoded = try? JSONDecoder().decode([SavedArticle].self, from: data) else {
             return
         }
 
         articles = decoded
+        saveToDisk()
+        UserDefaults.standard.removeObject(forKey: legacyStorageKey)
+    }
+
+    private func storageURL() throws -> URL {
+        let fileManager = FileManager.default
+        let applicationSupportURL = try fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        )
+        let appDirectoryURL = applicationSupportURL.appendingPathComponent("TaxAndFacts", isDirectory: true)
+        if !fileManager.fileExists(atPath: appDirectoryURL.path) {
+            try fileManager.createDirectory(at: appDirectoryURL, withIntermediateDirectories: true)
+        }
+        return appDirectoryURL.appendingPathComponent(storageFileName)
     }
 }
 
