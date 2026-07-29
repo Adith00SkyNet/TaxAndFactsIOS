@@ -9,14 +9,19 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var readLaterManager = ReadLaterManager()
+    @State private var networkStatusMonitor = NetworkStatusMonitor()
     @State private var selectedScreen: AppScreen = .home
     @State private var webURL = AppConfiguration.productionWebURL
     @State private var webHistory: [URL] = []
     @State private var isRestoringWebHistory = false
     @State private var canGoBack = false
     @State private var backRequestID = 0
-    @State private var isOffline = false
+    @State private var webViewOffline = false
     @State private var selectedSavedArticle: SavedArticle?
+
+    private var isOffline: Bool {
+        networkStatusMonitor.isOffline || webViewOffline
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -26,7 +31,10 @@ struct ContentView: View {
                     HomeTabContainer(
                         manager: readLaterManager,
                         url: $webURL,
-                        isOffline: $isOffline,
+                        isOffline: Binding(
+                            get: { isOffline },
+                            set: { webViewOffline = $0 }
+                        ),
                         canGoBack: $canGoBack,
                         backRequestID: $backRequestID,
                         onNavigationFinished: handleWebNavigation
@@ -61,6 +69,11 @@ struct ContentView: View {
             )
         }
         .onChange(of: isOffline) { _, newValue in
+            if newValue {
+                selectedScreen = .saved
+            }
+        }
+        .onChange(of: networkStatusMonitor.isOffline) { _, newValue in
             if newValue {
                 selectedScreen = .saved
             }
@@ -197,6 +210,7 @@ private struct HomeTabContainer: View {
     private enum W2ScanSource {
         case camera
         case photoLibrary
+        case file
     }
 
     private struct UploadSuccessState: Identifiable {
@@ -224,12 +238,15 @@ private struct HomeTabContainer: View {
     @State private var w2PopulateRequestID = 0
     @State private var isShowingCamera = false
     @State private var isShowingPhotoLibrary = false
+    @State private var isShowingFileImporter = false
     @State private var isShowingCaptureOptions = false
     @State private var isRecognizingText = false
     @State private var isCalculatorStep2 = false
     @State private var isCalculatorStep4 = false
     @State private var uploadSuccessState: UploadSuccessState?
     @State private var captureAlert: CalculatorCaptureAlert?
+    @State private var unclearImageAlert: CalculatorCaptureAlert?
+    @State private var documentNotRecognizedAlert: CalculatorCaptureAlert?
     @State private var lastW2ScanSource: W2ScanSource = .camera
     @State private var shouldPopulateQueuedW2Documents = false
     @State private var resultPageCaptureController = ResultPageCaptureController()
@@ -313,8 +330,13 @@ private struct HomeTabContainer: View {
             }
                 .ignoresSafeArea()
         }
+        .sheet(isPresented: $isShowingPhotoLibrary) {
+            PhotoLibraryCaptureView { image in
+                processCapturedImage(image, source: .photoLibrary)
+            }
+        }
         .fileImporter(
-            isPresented: $isShowingPhotoLibrary,
+            isPresented: $isShowingFileImporter,
             allowedContentTypes: [.image, .pdf],
             allowsMultipleSelection: false
         ) { result in
@@ -392,7 +414,7 @@ private struct HomeTabContainer: View {
                     title: Text(alert.title),
                     message: Text(alert.message),
                     primaryButton: .default(Text("Upload again"), action: reopenLastScanSource),
-                    secondaryButton: .cancel(Text("Enter manually [1]"), action: enterW2Manually)
+                    secondaryButton: .cancel(Text("Enter manually"), action: enterW2Manually)
                 )
             case .cameraAccessDenied:
                 return Alert(
@@ -423,9 +445,14 @@ private struct HomeTabContainer: View {
                     openCamera()
                 })
 
-                alert.addAction(UIAlertAction(title: "Upload file or photo", style: .default) { _ in
+                alert.addAction(UIAlertAction(title: "Upload image", style: .default) { _ in
                     dismiss()
                     openPhotoLibrary()
+                })
+
+                alert.addAction(UIAlertAction(title: "Upload file", style: .default) { _ in
+                    dismiss()
+                    openFileImporter()
                 })
 
                 alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
@@ -471,6 +498,82 @@ private struct HomeTabContainer: View {
                 })
 
                 return alert
+            }
+        )
+        .background(
+            NativeCenteredAlertPresenter(isPresented: Binding(
+                get: { unclearImageAlert != nil },
+                set: { newValue in
+                    if !newValue {
+                        unclearImageAlert = nil
+                    }
+                }
+            )) { dismiss in
+                let alert = unclearImageAlert ?? CalculatorCaptureAlert(
+                    title: "Unclear image",
+                    message: "We couldn't read the text on your W-2. Please try again with a clearer photo or upload a digital PDF.",
+                    kind: .documentNotRecognized
+                )
+
+                let alertController = UIAlertController(
+                    title: alert.title,
+                    message: alert.message,
+                    preferredStyle: .alert
+                )
+
+                alertController.addAction(UIAlertAction(title: "Upload again", style: .default) { _ in
+                    dismiss()
+                    reopenLastScanSource()
+                })
+
+                alertController.addAction(UIAlertAction(title: "Enter manually", style: .default) { _ in
+                    dismiss()
+                    enterW2Manually()
+                })
+
+                alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alertController
+            }
+        )
+        .background(
+            NativeCenteredAlertPresenter(isPresented: Binding(
+                get: { documentNotRecognizedAlert != nil },
+                set: { newValue in
+                    if !newValue {
+                        documentNotRecognizedAlert = nil
+                    }
+                }
+            )) { dismiss in
+                let alert = documentNotRecognizedAlert ?? CalculatorCaptureAlert(
+                    title: "Document not recognized",
+                    message: "We couldn't find a valid W-2 form in this file. Please make sure you are uploading an official W-2 tax document.",
+                    kind: .documentNotRecognized
+                )
+
+                let alertController = UIAlertController(
+                    title: alert.title,
+                    message: alert.message,
+                    preferredStyle: .alert
+                )
+
+                alertController.addAction(UIAlertAction(title: "Upload again", style: .default) { _ in
+                    dismiss()
+                    reopenLastScanSource()
+                })
+
+                alertController.addAction(UIAlertAction(title: "Enter manually", style: .default) { _ in
+                    dismiss()
+                    enterW2Manually()
+                })
+
+                alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alertController
             }
         )
         .overlay {
@@ -838,12 +941,19 @@ private struct HomeTabContainer: View {
         isShowingPhotoLibrary = true
     }
 
+    private func openFileImporter() {
+        lastW2ScanSource = .file
+        isShowingFileImporter = true
+    }
+
     private func reopenLastScanSource() {
         switch lastW2ScanSource {
         case .camera:
             openCamera()
         case .photoLibrary:
             openPhotoLibrary()
+        case .file:
+            openFileImporter()
         }
     }
 
@@ -871,11 +981,22 @@ private struct HomeTabContainer: View {
 
             await MainActor.run { [recognizedText, extractedFields, captureText] in
                 if !hasWagesValue(extractedFields) {
-                    captureAlert = CalculatorCaptureAlert(
-                        title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
-                        message: captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields),
-                        kind: .documentNotRecognized
-                    )
+                    let alertTitle = captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields)
+                    let alertMessage = captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields)
+
+                    if alertTitle == "Unclear image" {
+                        unclearImageAlert = CalculatorCaptureAlert(
+                            title: alertTitle,
+                            message: alertMessage,
+                            kind: .documentNotRecognized
+                        )
+                    } else {
+                        documentNotRecognizedAlert = CalculatorCaptureAlert(
+                            title: alertTitle,
+                            message: alertMessage,
+                            kind: .documentNotRecognized
+                        )
+                    }
                 } else if extractedFields.hasAnyValue {
                     captureManager.saveCapture(
                         pageTitle: currentTitle,
@@ -921,7 +1042,7 @@ private struct HomeTabContainer: View {
             }
 
             await MainActor.run {
-                self.processCapturedImage(image, source: .photoLibrary)
+                self.processCapturedImage(image, source: .file)
             }
         }
     }
@@ -3732,11 +3853,7 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
         view.addSubview(controlsStack)
 
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        statusLabel.textAlignment = .center
-        statusLabel.numberOfLines = 0
-        statusLabel.textColor = .white
-        statusLabel.font = .preferredFont(forTextStyle: .footnote)
-        statusLabel.text = "Preparing camera..."
+        statusLabel.isHidden = true
 
         captureButton.translatesAutoresizingMaskIntoConstraints = false
         captureButton.setImage(UIImage(systemName: "circle.inset.filled"), for: .normal)
@@ -3751,28 +3868,26 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
         cancelButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
         cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
 
-        controlsStack.addArrangedSubview(statusLabel)
         controlsStack.addArrangedSubview(captureButton)
         controlsStack.addArrangedSubview(cancelButton)
 
         NSLayoutConstraint.activate([
-            previewView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-            previewView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            previewView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            previewView.heightAnchor.constraint(equalTo: previewView.widthAnchor, multiplier: 9.0 / 16.0),
+            previewView.topAnchor.constraint(equalTo: view.topAnchor),
+            previewView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            previewView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            previewView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-            controlsStack.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 24),
-            controlsStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             controlsStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
             controlsStack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
-            controlsStack.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            controlsStack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -24),
+            controlsStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
 
             captureButton.widthAnchor.constraint(equalToConstant: 76),
             captureButton.heightAnchor.constraint(equalToConstant: 76)
         ])
 
         if let previewLayer = previewView.previewLayer {
-            previewLayer.videoGravity = .resizeAspectFill
+            previewLayer.videoGravity = .resizeAspect
         }
     }
 
@@ -3787,18 +3902,16 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
                     if granted {
                         self.configureSessionIfNeeded()
                     } else {
-                        self.statusLabel.text = "Camera access is required."
                         self.cancelButton.setTitle("Close", for: .normal)
                         self.onPermissionDenied()
                     }
                 }
             }
         case .denied, .restricted:
-            statusLabel.text = "Camera access is required."
             cancelButton.setTitle("Close", for: .normal)
             onPermissionDenied()
         @unknown default:
-            statusLabel.text = "Camera unavailable."
+            cancelButton.setTitle("Close", for: .normal)
         }
     }
 
@@ -3809,7 +3922,6 @@ private final class CameraCaptureViewController: UIViewController, AVCapturePhot
         }
 
         hasConfiguredSession = true
-        statusLabel.text = "Position the W-2 inside the frame."
 
         sessionQueue.async { [weak self] in
             guard let self else { return }

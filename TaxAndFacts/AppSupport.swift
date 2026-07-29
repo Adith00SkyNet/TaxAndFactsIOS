@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Network
 import UserNotifications
 import WebKit
 
@@ -87,6 +88,30 @@ struct CalculatorCaptureAlert: Identifiable {
 
     static func info(title: String, message: String) -> CalculatorCaptureAlert {
         CalculatorCaptureAlert(title: title, message: message, kind: .info)
+    }
+}
+
+@MainActor
+@Observable
+final class NetworkStatusMonitor {
+    private let monitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "TaxAndFacts.NetworkStatusMonitor")
+
+    private(set) var isOffline = false
+
+    init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor in
+                self?.isOffline = path.status != .satisfied
+            }
+        }
+
+        monitor.start(queue: monitorQueue)
+        isOffline = monitor.currentPath.status != .satisfied
+    }
+
+    deinit {
+        monitor.cancel()
     }
 }
 
@@ -377,10 +402,13 @@ final class ReadLaterManager {
             appropriateFor: nil,
             create: true
         )
-        let appDirectoryURL = applicationSupportURL.appendingPathComponent("TaxAndFacts", isDirectory: true)
+        var appDirectoryURL = applicationSupportURL.appendingPathComponent("TaxAndFacts", isDirectory: true)
         if !fileManager.fileExists(atPath: appDirectoryURL.path) {
             try fileManager.createDirectory(at: appDirectoryURL, withIntermediateDirectories: true)
         }
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try appDirectoryURL.setResourceValues(resourceValues)
         return appDirectoryURL.appendingPathComponent(storageFileName)
     }
 }
