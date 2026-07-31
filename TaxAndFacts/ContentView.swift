@@ -1712,15 +1712,6 @@ private struct HomeTabContainer: View {
                         .toLowerCase();
                 }
 
-                function findHelpLabel() {
-                    var helpLabel = document.querySelector('#inn-tab1 .position-absolute .info-icon span.ml-1[style*="italic"]');
-                    if (helpLabel && isVisible(helpLabel) && normalize(helpLabel.textContent || '') === 'help') {
-                        return helpLabel;
-                    }
-
-                    return null;
-                }
-
                 function removeButton() {
                     var existing = document.getElementById('taxfacts-w2-scan-target');
                     if (existing && existing.parentNode) {
@@ -1728,8 +1719,7 @@ private struct HomeTabContainer: View {
                     }
                 }
 
-                function createButton(helpLabel) {
-                    var row = document.querySelector('#inn-tab1 .col-12.d-flex.align-items-center.position-relative');
+                function createButton(row) {
                     if (!row) {
                         return;
                     }
@@ -1741,8 +1731,8 @@ private struct HomeTabContainer: View {
 
                     var buttonHost = document.createElement('span');
                     buttonHost.id = 'taxfacts-w2-scan-target';
-                    buttonHost.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;margin-top:24px;margin-right:6px;';
-                    buttonHost.innerHTML = '<button type="button" aria-label="Scan W-2" title="Scan W-2" style="appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:1px solid #000000;border-radius:50%;background:#000000;box-shadow:none;cursor:pointer;pointer-events:auto;vertical-align:middle;"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" style="width:14px;height:14px;display:block;fill:none;stroke:#ffffff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;"><path d="M12 4v10"></path><path d="M8.5 7.5L12 4l3.5 3.5"></path><path d="M5 14.5v3A2.5 2.5 0 0 0 7.5 20h9A2.5 2.5 0 0 0 19 17.5v-3"></path></svg></button>';
+                    buttonHost.style.cssText = 'position:absolute;left:15px;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;justify-content:center;margin:0;z-index:5;pointer-events:auto;';
+                    buttonHost.innerHTML = '<button type="button" aria-label="Scan W-2" title="Scan W-2" style="appearance:none;-webkit-appearance:none;display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;padding:0;border:1px solid #000000;border-radius:50%;background:#000000;box-shadow:none;cursor:pointer;pointer-events:auto;vertical-align:middle;"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" style="width:12.7px;height:12.7px;display:block;fill:none;stroke:#ffffff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;"><path d="M12 4v10"></path><path d="M8.5 7.5L12 4l3.5 3.5"></path><path d="M5 14.5v3A2.5 2.5 0 0 0 7.5 20h9A2.5 2.5 0 0 0 19 17.5v-3"></path></svg></button><span style="margin-left:6px;color:#949494;font-size:9.83125px;line-height:1;vertical-align:middle;font-family:Montserrat, Arial, Verdana, sans-serif;">W2-Upload</span>';
 
                     var button = buttonHost.firstElementChild;
                     button.addEventListener('click', function(event) {
@@ -1753,7 +1743,7 @@ private struct HomeTabContainer: View {
                         } catch (error) {}
                     });
 
-                    row.insertBefore(buttonHost, row.firstChild);
+                    row.insertAdjacentElement('afterbegin', buttonHost);
                 }
 
                 function refreshButton() {
@@ -1763,8 +1753,7 @@ private struct HomeTabContainer: View {
                     }
 
                     var row = document.querySelector('#inn-tab1 .col-12.d-flex.align-items-center.position-relative');
-                    var helpLabel = findHelpLabel();
-                    if (!helpLabel || !row) {
+                    if (!row) {
                         removeButton();
                         return;
                     }
@@ -1775,7 +1764,7 @@ private struct HomeTabContainer: View {
                     }
 
                     removeButton();
-                    createButton(helpLabel);
+                    createButton(row);
                 }
 
                 function scheduleRefresh() {
