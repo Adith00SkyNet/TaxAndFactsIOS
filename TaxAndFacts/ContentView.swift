@@ -253,6 +253,7 @@ private struct HomeTabContainer: View {
     @State private var isShowingResultSaveOptions = false
     @State private var isShowingPDFExportPicker = false
     @State private var pdfExportURL: URL?
+    @State private var previousStepRequestID = 0
     @State private var isSavingResultPage = false
     @State private var successToastState: SuccessToastState?
 
@@ -289,6 +290,7 @@ private struct HomeTabContainer: View {
                     shouldPopulateQueuedW2Documents: $shouldPopulateQueuedW2Documents,
                     canGoBack: $canGoBack,
                     backRequestID: $backRequestID,
+                    previousStepRequestID: $previousStepRequestID,
                     isCalculatorStep2: $isCalculatorStep2,
                     isCalculatorStep4: $isCalculatorStep4,
                     resultPageCaptureController: resultPageCaptureController,
@@ -1077,6 +1079,7 @@ private struct HomeTabContainer: View {
 
         pendingW2Documents.removeLast()
         uploadSuccessState = nil
+        previousStepRequestID += 1
     }
 
     private func captureAlertTitle(recognizedText: String, extractedFields: W2ExtractedFields) -> String {
@@ -1137,6 +1140,7 @@ private struct HomeTabContainer: View {
     @Binding var shouldPopulateQueuedW2Documents: Bool
     @Binding var canGoBack: Bool
     @Binding var backRequestID: Int
+    @Binding var previousStepRequestID: Int
     @Binding var isCalculatorStep2: Bool
     @Binding var isCalculatorStep4: Bool
     let resultPageCaptureController: ResultPageCaptureController
@@ -1174,6 +1178,14 @@ private struct HomeTabContainer: View {
             return
         }
 
+        if context.coordinator.handledPreviousStepRequestID != previousStepRequestID {
+            context.coordinator.handledPreviousStepRequestID = previousStepRequestID
+            DispatchQueue.main.async {
+                context.coordinator.clickCalculatorPreviousButton(in: uiView)
+            }
+            return
+        }
+
         if context.coordinator.loadedURL != url {
             uiView.load(request(for: url))
             context.coordinator.loadedURL = url
@@ -1204,6 +1216,7 @@ private struct HomeTabContainer: View {
         var parent: NativeWebViewWrapper
         var loadedURL: URL?
         var handledBackRequestID = 0
+        var handledPreviousStepRequestID = 0
         var handledW2PopulateRequestID = -1
         var submittedW2PopulateRequestID = -1
         var w2PrefillRetryTimer: Timer?
@@ -1787,6 +1800,30 @@ private struct HomeTabContainer: View {
                 }
 
                 refreshButton();
+            })();
+            """#
+
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+
+        func clickCalculatorPreviousButton(in webView: WKWebView) {
+            let script = #"""
+            (function() {
+                var selectors = [
+                    'button.btn-prev.btn-wiz-prev',
+                    'button[ng-click="tabChanged(1, 1)"]',
+                    'button[ng-click*="tabChanged(1, 1)"]'
+                ];
+
+                for (var i = 0; i < selectors.length; i += 1) {
+                    var button = document.querySelector(selectors[i]);
+                    if (button) {
+                        button.click();
+                        return true;
+                    }
+                }
+
+                return false;
             })();
             """#
 
