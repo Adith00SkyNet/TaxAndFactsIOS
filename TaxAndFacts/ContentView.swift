@@ -418,6 +418,13 @@ private struct HomeTabContainer: View {
                     primaryButton: .default(Text("Upload again"), action: reopenLastScanSource),
                     secondaryButton: .cancel(Text("Enter manually"), action: enterW2Manually)
                 )
+            case .duplicateDocument:
+                return Alert(
+                    title: Text(alert.title),
+                    message: Text(alert.message),
+                    primaryButton: .default(Text("Upload again"), action: reopenLastScanSource),
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
             case .cameraAccessDenied:
                 return Alert(
                     title: Text(alert.title),
@@ -980,7 +987,6 @@ private struct HomeTabContainer: View {
                 "hasValues=\(extractedFields.hasAnyValue) " +
                 "wages=\(extractedFields.wages ?? "nil")"
             )
-
             await MainActor.run { [recognizedText, extractedFields, captureText] in
                 if !hasWagesValue(extractedFields) {
                     let alertTitle = captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields)
@@ -1000,13 +1006,21 @@ private struct HomeTabContainer: View {
                         )
                     }
                 } else if extractedFields.hasAnyValue {
-                    captureManager.saveCapture(
-                        pageTitle: currentTitle,
-                        urlString: currentURLString,
-                        recognizedText: captureText
-                    )
-                    pendingW2Documents.append(extractedFields)
-                    uploadSuccessState = UploadSuccessState(documentNumber: pendingW2Documents.count)
+                    if isDuplicateW2Document(extractedFields) {
+                        captureAlert = CalculatorCaptureAlert(
+                            title: "Duplicate document",
+                            message: "This W-2 appears to match one you have already uploaded. Please upload a different W-2.",
+                            kind: .duplicateDocument
+                        )
+                    } else {
+                        captureManager.saveCapture(
+                            pageTitle: currentTitle,
+                            urlString: currentURLString,
+                            recognizedText: captureText
+                        )
+                        pendingW2Documents.append(extractedFields)
+                        uploadSuccessState = UploadSuccessState(documentNumber: pendingW2Documents.count)
+                    }
                 } else {
                     captureAlert = CalculatorCaptureAlert(
                         title: captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields),
@@ -1080,6 +1094,12 @@ private struct HomeTabContainer: View {
         pendingW2Documents.removeLast()
         uploadSuccessState = nil
         previousStepRequestID += 1
+    }
+
+    private func isDuplicateW2Document(_ extractedFields: W2ExtractedFields) -> Bool {
+        pendingW2Documents.contains { existingFields in
+            existingFields.duplicateComparisonKey == extractedFields.duplicateComparisonKey
+        }
     }
 
     private func captureAlertTitle(recognizedText: String, extractedFields: W2ExtractedFields) -> String {
@@ -4182,13 +4202,23 @@ private enum W2FieldExtractor {
         "state tax"
     ], preferLargestNumericValue: false)
 
+    private static let einSpec = FieldSpec(labels: [
+        "employer identification number",
+        "employer identification no",
+        "employer id number",
+        "employer id no",
+        "employer ein",
+        "ein"
+    ], preferLargestNumericValue: false)
+
     private static var allTargetLabels: [String] {
-        [wagesSpec, federalTaxSpec, medicareSpec, socialSecurityTipsSpec, allocatedTipsSpec, stateTaxSpec].flatMap(\.labels)
+        [wagesSpec, federalTaxSpec, medicareSpec, socialSecurityTipsSpec, allocatedTipsSpec, stateTaxSpec, einSpec].flatMap(\.labels)
     }
 
     static func extractFields(from text: String, items: [RecognizedTextItem] = []) -> W2ExtractedFields {
         let fallbackFields = extractFieldsFromText(text)
         let extractedFields = W2ExtractedFields(
+            employerIdentificationNumber: extractEmployerIdentificationNumber(from: text) ?? fallbackFields.employerIdentificationNumber,
             wages: extractPositionedValue(from: items, spec: wagesSpec, minimumWholeDollarDigits: 1) ?? fallbackFields.wages,
             federalIncomeTaxWithheld: extractPositionedValue(from: items, spec: federalTaxSpec) ?? fallbackFields.federalIncomeTaxWithheld,
             medicareWagesAndTips: extractPositionedValue(from: items, spec: medicareSpec) ?? fallbackFields.medicareWagesAndTips,
@@ -4209,6 +4239,7 @@ private enum W2FieldExtractor {
         debugMatchingTipLabels(in: lines, label: "text")
 
         return W2ExtractedFields(
+            employerIdentificationNumber: extractEmployerIdentificationNumber(from: text) ?? extractEmployerIdentificationNumber(from: lines),
             wages: extractValueAfterLabel(from: lines, spec: wagesSpec, minimumWholeDollarDigits: 1),
             federalIncomeTaxWithheld: extractValueAfterLabel(from: lines, spec: federalTaxSpec),
             medicareWagesAndTips: extractValueAfterLabel(from: lines, spec: medicareSpec),
@@ -4216,6 +4247,54 @@ private enum W2FieldExtractor {
             socialSecurityTips: extractValueAfterLabelStrict(from: lines, spec: socialSecurityTipsSpec, minimumWholeDollarDigits: 3),
             allocatedTips: extractValueAfterLabelStrict(from: lines, spec: allocatedTipsSpec, minimumWholeDollarDigits: 3)
         )
+    }
+
+    private static func extractEmployerIdentificationNumber(from text: String) -> String? {
+        let lines = text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        return extractEmployerIdentificationNumber(from: lines)
+    }
+
+    private static func extractEmployerIdentificationNumber(from lines: [String]) -> String? {
+        guard !lines.isEmpty else { return nil }
+
+        for (lineIndex, line) in lines.enumerated() where matchesFieldLabel(line, spec: einSpec) {
+            let currentText = textAfterBestLabel(in: line, labels: einSpec.labels)
+            if let value = firstEmployerIdentificationNumber(in: currentText) {
+                return value
+            }
+
+            let searchEndIndex = lines[(lineIndex + 1)...].firstIndex { candidateLine in
+                let normalized = normalizedSearchText(candidateLine)
+                return containsAnyLabel(normalized, labels: allTargetLabels) || containsIgnoredW2Label(candidateLine)
+            } ?? lines.endIndex
+
+            for candidateLine in lines[(lineIndex + 1)..<searchEndIndex] {
+                if let value = firstEmployerIdentificationNumber(in: candidateLine) {
+                    return value
+                }
+            }
+        }
+
+        for line in lines {
+            if let value = firstEmployerIdentificationNumber(in: line) {
+                return value
+            }
+        }
+
+        return nil
+    }
+
+    private static func firstEmployerIdentificationNumber(in text: String) -> String? {
+        let digitsOnly = text.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+        guard digitsOnly.count >= 9 else { return nil }
+
+        let value = String(digitsOnly.prefix(9))
+        guard value.count == 9 else { return nil }
+        return "\(value.prefix(2))-\(value.suffix(7))"
     }
 
     private static func debugMatchingTipLabels(in lines: [String], label: String) {

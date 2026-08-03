@@ -54,6 +54,7 @@ enum TextRecognizer {
 }
 
 struct W2ExtractedFields: Equatable {
+    let employerIdentificationNumber: String?
     let wages: String?
     let federalIncomeTaxWithheld: String?
     let medicareWagesAndTips: String?
@@ -63,6 +64,7 @@ struct W2ExtractedFields: Equatable {
 
     var summaryText: String {
         [
+            "Employer identification number: \(summaryValue(employerIdentificationNumber))",
             "Wages, tips, other comp: \(summaryValue(wages))",
             "Federal income tax withheld: \(summaryValue(federalIncomeTaxWithheld))",
             "Medicare wages and tips: \(summaryValue(medicareWagesAndTips))",
@@ -74,11 +76,24 @@ struct W2ExtractedFields: Equatable {
     }
 
     var hasAnyValue: Bool {
-        [wages, federalIncomeTaxWithheld, medicareWagesAndTips, stateIncomeTaxWithheld, socialSecurityTips, allocatedTips]
+        [employerIdentificationNumber, wages, federalIncomeTaxWithheld, medicareWagesAndTips, stateIncomeTaxWithheld, socialSecurityTips, allocatedTips]
             .contains { value in
                 guard let value else { return false }
                 return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
+    }
+
+    var duplicateComparisonKey: String {
+        [
+            normalizedComparisonValue(employerIdentificationNumber),
+            normalizedComparisonValue(wages),
+            normalizedComparisonValue(federalIncomeTaxWithheld),
+            normalizedComparisonValue(medicareWagesAndTips),
+            normalizedComparisonValue(stateIncomeTaxWithheld),
+            normalizedComparisonValue(socialSecurityTips),
+            normalizedComparisonValue(allocatedTips)
+        ]
+        .joined(separator: "|")
     }
 
     private func summaryValue(_ value: String?) -> String {
@@ -87,6 +102,14 @@ struct W2ExtractedFields: Equatable {
         }
 
         return value
+    }
+
+    private func normalizedComparisonValue(_ value: String?) -> String {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return "" }
+        return trimmed
+            .lowercased()
+            .replacingOccurrences(of: #"\D+"#, with: "", options: .regularExpression)
     }
 }
 

@@ -62,6 +62,7 @@ struct CalculatorCaptureAlert: Identifiable {
         case info
         case scanDecision
         case documentNotRecognized
+        case duplicateDocument
         case cameraAccessDenied
         case photosAccessDenied
     }
