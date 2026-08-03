@@ -996,7 +996,13 @@ private struct HomeTabContainer: View {
                 "wages=\(extractedFields.wages ?? "nil")"
             )
             await MainActor.run { [recognizedText, extractedFields, captureText] in
-                if !hasWagesValue(extractedFields) {
+                if isW2Mentioned(in: recognizedText), !hasWagesValue(extractedFields) {
+                    unclearImageAlert = CalculatorCaptureAlert(
+                        title: "W-2 detected, but unclear",
+                        message: "We found W-2 text in this document, but the values are not clear enough to extract. Please upload a clearer photo or scan a sharper W-2.",
+                        kind: .documentNotRecognized
+                    )
+                } else if !hasWagesValue(extractedFields) {
                     let alertTitle = captureAlertTitle(recognizedText: recognizedText, extractedFields: extractedFields)
                     let alertMessage = captureAlertMessage(recognizedText: recognizedText, extractedFields: extractedFields)
 
@@ -1144,6 +1150,15 @@ private struct HomeTabContainer: View {
         }
 
         return true
+    }
+
+    private func isW2Mentioned(in recognizedText: String) -> Bool {
+        let normalizedText = recognizedText
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+
+        return normalizedText.contains("w2")
     }
 
     private func previewMessage(for text: String) -> String {
