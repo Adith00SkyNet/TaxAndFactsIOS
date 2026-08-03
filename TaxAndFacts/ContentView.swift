@@ -43,7 +43,8 @@ struct ContentView: View {
                     SavedContentView(
                         manager: readLaterManager,
                         isOffline: isOffline,
-                        onOpen: openSavedArticle
+                        onOpen: openSavedArticle,
+                        onBrowseArticles: showBlogList
                     )
                 case .savedArticle:
                     if let selectedSavedArticle {
@@ -109,6 +110,13 @@ struct ContentView: View {
     private func showHome() {
         selectedScreen = .home
         webURL = AppConfiguration.productionWebURL
+        webHistory.removeAll()
+        canGoBack = false
+    }
+
+    private func showBlogList() {
+        selectedScreen = .home
+        webURL = URL(string: "https://taxandfacts.com/blogList.html")!
         webHistory.removeAll()
         canGoBack = false
     }
@@ -3518,6 +3526,7 @@ private struct HomeTabContainer: View {
 
             webView.evaluateJavaScript(script, completionHandler: nil)
         }
+
     }
 }
 
@@ -3525,36 +3534,78 @@ private struct SavedContentView: View {
     let manager: ReadLaterManager
     let isOffline: Bool
     let onOpen: (SavedArticle) -> Void
+    let onBrowseArticles: () -> Void
     @State private var pendingRemovalArticle: SavedArticle?
 
     var body: some View {
         NavigationStack {
-            Group {
-                if manager.articles.isEmpty {
-                    ContentUnavailableView(
-                        "No Saved Content",
-                        systemImage: "bookmark",
-                        description: Text("Open https://taxandfacts.com/help/ and tap Save to keep it for offline reading.")
-                    )
-                } else {
-                    List {
-                        ForEach(manager.articles) { article in
-                            SavedArticleRow(
-                                article: article,
-                                isRead: Binding(
-                                    get: { article.isRead },
-                                    set: { manager.setArticle(article, isRead: $0) }
-                                ),
-                                onOpen: { onOpen(article) },
-                                onDelete: { pendingRemovalArticle = article }
-                            )
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(isOffline ? "Offline Saved" : "Saved Content")
+                        .font(.title2.weight(.semibold))
+
+                    Text("Your saved articles are kept here for 15 days for offline reading.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+                Group {
+                    if manager.articles.isEmpty {
+                        VStack(spacing: 0) {
+                            Image(systemName: "bookmark")
+                                .font(.system(size: 28, weight: .regular))
+                                .foregroundStyle(.secondary)
+                                .padding(.bottom, 8)
+
+                            Text("No saved articles yet")
+                                .font(.headline)
+                                .multilineTextAlignment(.center)
+
+                            Text("Tap the \"Save for offline\" ribbon on any article to download it and read it here later without internet.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.top, 6)
+
+                            Button {
+                                onBrowseArticles()
+                            } label: {
+                                Text("Browse Articles")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.black)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color(red: 1.0, green: 0.749, blue: 0.027))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.top, 6)
                         }
-                        .onDelete(perform: manager.deleteArticles)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    } else {
+                        List {
+                            ForEach(manager.articles) { article in
+                                SavedArticleRow(
+                                    article: article,
+                                    isRead: Binding(
+                                        get: { article.isRead },
+                                        set: { manager.setArticle(article, isRead: $0) }
+                                    ),
+                                    onOpen: { onOpen(article) },
+                                    onDelete: { pendingRemovalArticle = article }
+                                )
+                            }
+                            .onDelete(perform: manager.deleteArticles)
+                        }
+                        .listStyle(.insetGrouped)
                     }
-                    .listStyle(.insetGrouped)
                 }
             }
-            .navigationTitle(isOffline ? "Offline Saved" : "Saved Content")
+            .navigationTitle("")
+            .navigationBarTitleDisplayMode(.inline)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .alert(item: $pendingRemovalArticle) { article in
                 Alert(
                     title: Text("Remove from offline?"),
@@ -3707,7 +3758,7 @@ private struct SavePageToggleButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label(isSaved ? "Saved offline" : "Save for offline", systemImage: isSaved ? "bookmark.fill" : "bookmark")
+            Label(isSaved ? "Saved offline" : "Read offline", systemImage: isSaved ? "bookmark.fill" : "bookmark")
                 .font(.headline)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
