@@ -28,17 +28,26 @@ struct ContentView: View {
             ZStack {
                 switch selectedScreen {
                 case .home:
-                    HomeTabContainer(
-                        manager: readLaterManager,
-                        url: $webURL,
-                        isOffline: Binding(
-                            get: { isOffline },
-                            set: { webViewOffline = $0 }
-                        ),
-                        canGoBack: $canGoBack,
-                        backRequestID: $backRequestID,
-                        onNavigationFinished: handleWebNavigation
-                    )
+                    if isOffline {
+                        SavedContentView(
+                            manager: readLaterManager,
+                            isOffline: isOffline,
+                            onOpen: openSavedArticle,
+                            onBrowseArticles: showBlogList
+                        )
+                    } else {
+                        HomeTabContainer(
+                            manager: readLaterManager,
+                            url: $webURL,
+                            isOffline: Binding(
+                                get: { isOffline },
+                                set: { webViewOffline = $0 }
+                            ),
+                            canGoBack: $canGoBack,
+                            backRequestID: $backRequestID,
+                            onNavigationFinished: handleWebNavigation
+                        )
+                    }
                 case .saved:
                     SavedContentView(
                         manager: readLaterManager,
@@ -64,6 +73,7 @@ struct ContentView: View {
 
             AppNavigationBar(
                 canGoBack: selectedScreen == .saved || selectedScreen == .savedArticle || canNavigateBackInHome,
+                isOffline: isOffline,
                 onBack: goBack,
                 onHome: showHome,
                 onSaved: showSaved
@@ -108,6 +118,11 @@ struct ContentView: View {
     }
 
     private func showHome() {
+        guard !isOffline else {
+            selectedScreen = .saved
+            return
+        }
+
         selectedScreen = .home
         webURL = AppConfiguration.productionWebURL
         webHistory.removeAll()
@@ -3556,7 +3571,7 @@ private struct SavedContentView: View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(isOffline ? "Offline Saved" : "Saved Content")
+                    Text("Saved Content")
                         .font(.title2.weight(.semibold))
 
                     Text("Your saved articles are kept here for 15 days for offline reading.")
@@ -3773,7 +3788,7 @@ private struct SavePageToggleButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label(isSaved ? "Saved offline" : "Read offline", systemImage: isSaved ? "bookmark.fill" : "bookmark")
+            Label(isSaved ? "Saved offline" : "Save offline", systemImage: isSaved ? "bookmark.fill" : "bookmark")
                 .font(.headline)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -4962,19 +4977,6 @@ private struct SavedArticleDetailView: View {
             } else {
                 ZStack(alignment: .top) {
                     OfflineHTMLView(htmlString: article.htmlString, baseURLString: article.urlString)
-
-                    if isOffline {
-                        HStack(spacing: 8) {
-                            Image(systemName: "folder.fill")
-                            Text("Reading offline")
-                        }
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
-                        .background(.black.opacity(0.78), in: Capsule())
-                        .padding(.top, 12)
-                    }
                 }
             }
         }
@@ -5295,6 +5297,7 @@ private struct AppNavigationBar: View {
     static let height: CGFloat = 76
 
     let canGoBack: Bool
+    let isOffline: Bool
     let onBack: () -> Void
     let onHome: () -> Void
     let onSaved: () -> Void
@@ -5305,7 +5308,9 @@ private struct AppNavigationBar: View {
                 .disabled(!canGoBack)
                 .opacity(canGoBack ? 1 : 0.4)
             navigationButton(title: "Home", systemImage: "house", action: onHome)
-            navigationButton(title: "Saved offline", systemImage: "bookmark", action: onSaved)
+                .disabled(isOffline)
+                .opacity(isOffline ? 0.4 : 1)
+            navigationButton(title: "Read offline", systemImage: "bookmark", action: onSaved)
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)

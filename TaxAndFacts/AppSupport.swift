@@ -102,8 +102,9 @@ final class NetworkStatusMonitor {
 
     init() {
         monitor.pathUpdateHandler = { [weak self] path in
-            Task { @MainActor in
-                self?.isOffline = path.status != .satisfied
+            let isOffline = path.status != .satisfied
+            Task { @MainActor [weak self] in
+                self?.isOffline = isOffline
             }
         }
 
@@ -193,6 +194,7 @@ final class ReadLaterManager {
 
     func saveArticle(title: String, urlString: String, htmlString: String, imageURLString: String, imageData: Data? = nil) {
         let cleanTitle = preferredTitle(from: title, htmlString: htmlString)
+        let cleanedHTMLString = sanitizedArticleHTML(from: htmlString)
         guard !urlString.isEmpty else { return }
 
         if let existingIndex = articles.firstIndex(where: { $0.urlString == urlString }) {
@@ -201,7 +203,7 @@ final class ReadLaterManager {
                 id: existing.id,
                 title: cleanTitle.isEmpty ? existing.title : cleanTitle,
                 urlString: urlString,
-                htmlString: htmlString,
+                htmlString: cleanedHTMLString,
                 imageURLString: imageURLString,
                 imageData: imageData ?? (existing.imageURLString == imageURLString ? existing.imageData : nil),
                 savedDate: Date(),
@@ -218,7 +220,7 @@ final class ReadLaterManager {
             id: UUID(),
             title: cleanTitle,
             urlString: urlString,
-            htmlString: htmlString,
+            htmlString: cleanedHTMLString,
             imageURLString: imageURLString,
             imageData: imageData,
             savedDate: Date(),
@@ -229,6 +231,28 @@ final class ReadLaterManager {
         saveToDisk()
         loadImageIfNeeded(for: article.id, imageURLString: imageURLString)
         scheduleExpirationWarning(for: article.id, title: cleanTitle)
+    }
+
+    private func sanitizedArticleHTML(from htmlString: String) -> String {
+        guard !htmlString.isEmpty else { return htmlString }
+
+        var sanitizedHTML = htmlString
+        let patterns = [
+            #"<header\b[^>]*>[\s\S]*?</header>"#,
+            #"<footer\b[^>]*>[\s\S]*?</footer>"#,
+            #"<nav\b[^>]*>[\s\S]*?</nav>"#,
+            #"<[^>]+\b(class|id)=\"[^\"]*(?:site-header|main-header|header|site-footer|main-footer|footer|navbar|nav)[^\"]*\"[^>]*>[\s\S]*?</[^>]+>"#
+        ]
+
+        for pattern in patterns {
+            sanitizedHTML = sanitizedHTML.replacingOccurrences(
+                of: pattern,
+                with: "",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+
+        return sanitizedHTML
     }
 
     func deleteArticle(id: UUID) {
@@ -677,6 +701,7 @@ struct AppNavigationBar: View {
     static let height: CGFloat = 76
 
     let canGoBack: Bool
+    let isOffline: Bool
     let onBack: () -> Void
     let onHome: () -> Void
     let onSaved: () -> Void
@@ -687,7 +712,9 @@ struct AppNavigationBar: View {
                 .disabled(!canGoBack)
                 .opacity(canGoBack ? 1 : 0.4)
             navigationButton(title: "Home", systemImage: "house", action: onHome)
-            navigationButton(title: "Saved", systemImage: "bookmark", action: onSaved)
+                .disabled(isOffline)
+                .opacity(isOffline ? 0.4 : 1)
+            navigationButton(title: "Read offline", systemImage: "bookmark", action: onSaved)
         }
         .padding(.horizontal, 14)
         .padding(.top, 8)
