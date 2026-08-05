@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Foundation
 import Network
 import UserNotifications
 import WebKit
@@ -99,21 +100,68 @@ final class NetworkStatusMonitor {
     private let monitorQueue = DispatchQueue(label: "TaxAndFacts.NetworkStatusMonitor")
 
     private(set) var isOffline = false
+    private var recoveryTask: Task<Void, Never>?
 
     init() {
+        startMonitoring()
+    }
+
+    private func startMonitoring() {
         monitor.pathUpdateHandler = { [weak self] path in
             let isOffline = path.status != .satisfied
-            Task { @MainActor [weak self] in
-                self?.isOffline = isOffline
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isOffline = isOffline
+                if isOffline {
+                    self.startRecoveryChecks()
+                } else {
+                    self.recoveryTask?.cancel()
+                    self.recoveryTask = nil
+                }
             }
         }
 
         monitor.start(queue: monitorQueue)
         isOffline = monitor.currentPath.status != .satisfied
+        if isOffline {
+            startRecoveryChecks()
+        }
     }
 
-    deinit {
-        monitor.cancel()
+    private func startRecoveryChecks() {
+        guard recoveryTask == nil else { return }
+
+        recoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self else { return }
+                if await self.probeConnectivity() {
+                    await MainActor.run {
+                        self.isOffline = false
+                        self.recoveryTask?.cancel()
+                        self.recoveryTask = nil
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    private func probeConnectivity() async -> Bool {
+        var request = URLRequest(
+            url: AppConfiguration.productionWebURL,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 5
+        )
+        request.httpMethod = "HEAD"
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else { return false }
+            return (200..<400).contains(httpResponse.statusCode)
+        } catch {
+            return false
+        }
     }
 }
 
@@ -241,7 +289,9 @@ final class ReadLaterManager {
             #"<header\b[^>]*>[\s\S]*?</header>"#,
             #"<footer\b[^>]*>[\s\S]*?</footer>"#,
             #"<nav\b[^>]*>[\s\S]*?</nav>"#,
-            #"<[^>]+\b(class|id)=\"[^\"]*(?:site-header|main-header|header|site-footer|main-footer|footer|navbar|nav)[^\"]*\"[^>]*>[\s\S]*?</[^>]+>"#
+            #"<aside\b[^>]*>[\s\S]*?</aside>"#,
+            #"<[^>]+\b(class|id)=\"[^\"]*(?:site-header|main-header|header|site-footer|main-footer|footer|navbar|nav|breadcrumb|topbar)[^\"]*\"[^>]*>[\s\S]*?</[^>]+>"#,
+            #"<[^>]+\b(role)=\"(?:banner|contentinfo)\"[^>]*>[\s\S]*?</[^>]+>"#
         ]
 
         for pattern in patterns {

@@ -18,8 +18,13 @@ struct ContentView: View {
     @State private var backRequestID = 0
     @State private var webViewOffline = false
     @State private var selectedSavedArticle: SavedArticle?
+    @State private var showingNoInternetAlert = false
 
     private var isOffline: Bool {
+        networkStatusMonitor.isOffline
+    }
+
+    private var isWebContentOffline: Bool {
         networkStatusMonitor.isOffline || webViewOffline
     }
 
@@ -33,14 +38,15 @@ struct ContentView: View {
                             manager: readLaterManager,
                             isOffline: isOffline,
                             onOpen: openSavedArticle,
-                            onBrowseArticles: showBlogList
+                            onBrowseArticles: showBlogList,
+                            onBrowseBlocked: showNoInternetAlert
                         )
                     } else {
                         HomeTabContainer(
                             manager: readLaterManager,
                             url: $webURL,
                             isOffline: Binding(
-                                get: { isOffline },
+                                get: { isWebContentOffline },
                                 set: { webViewOffline = $0 }
                             ),
                             canGoBack: $canGoBack,
@@ -53,7 +59,8 @@ struct ContentView: View {
                         manager: readLaterManager,
                         isOffline: isOffline,
                         onOpen: openSavedArticle,
-                        onBrowseArticles: showBlogList
+                        onBrowseArticles: showBlogList,
+                        onBrowseBlocked: showNoInternetAlert
                     )
                 case .savedArticle:
                     if let selectedSavedArticle {
@@ -72,7 +79,7 @@ struct ContentView: View {
             .clipped()
 
             AppNavigationBar(
-                canGoBack: selectedScreen == .saved || selectedScreen == .savedArticle || canNavigateBackInHome,
+                canGoBack: selectedScreen == .savedArticle || (!isOffline && (selectedScreen == .saved || canNavigateBackInHome)),
                 isOffline: isOffline,
                 onBack: goBack,
                 onHome: showHome,
@@ -87,11 +94,29 @@ struct ContentView: View {
         .onChange(of: networkStatusMonitor.isOffline) { _, newValue in
             if newValue {
                 selectedScreen = .saved
+            } else {
+                webViewOffline = false
+                selectedScreen = .home
+                webURL = AppConfiguration.productionWebURL
+                webHistory.removeAll()
+                canGoBack = false
             }
+        }
+        .alert("No internet connection", isPresented: $showingNoInternetAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Please connect to the internet to browse articles.")
         }
     }
 
     private func goBack() {
+        if isOffline {
+            guard selectedScreen == .savedArticle else { return }
+            selectedSavedArticle = nil
+            selectedScreen = .saved
+            return
+        }
+
         if selectedScreen == .savedArticle {
             selectedSavedArticle = nil
             selectedScreen = .saved
@@ -138,6 +163,10 @@ struct ContentView: View {
 
     private func showSaved() {
         selectedScreen = .saved
+    }
+
+    private func showNoInternetAlert() {
+        showingNoInternetAlert = true
     }
 
     private func openSavedArticle(_ article: SavedArticle) {
@@ -1003,13 +1032,6 @@ private struct HomeTabContainer: View {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let extractedFields = W2FieldExtractor.extractFields(from: recognizedText, items: recognizedItems)
             let captureText = extractedFields.summaryText
-
-            print(
-                "[TaxAndFacts] W2 scan doc fetch: source=\(source == .camera ? "camera" : "photoLibrary") " +
-                "recognizedItems=\(recognizedItems.count) " +
-                "hasValues=\(extractedFields.hasAnyValue) " +
-                "wages=\(extractedFields.wages ?? "nil")"
-            )
             await MainActor.run { [recognizedText, extractedFields, captureText] in
                 if isW2Mentioned(in: recognizedText), !hasWagesValue(extractedFields) {
                     unclearImageAlert = CalculatorCaptureAlert(
@@ -3565,6 +3587,7 @@ private struct SavedContentView: View {
     let isOffline: Bool
     let onOpen: (SavedArticle) -> Void
     let onBrowseArticles: () -> Void
+    let onBrowseBlocked: () -> Void
     @State private var pendingRemovalArticle: SavedArticle?
 
     var body: some View {
@@ -3601,7 +3624,11 @@ private struct SavedContentView: View {
                                 .padding(.top, 6)
 
                             Button {
-                                onBrowseArticles()
+                                if isOffline {
+                                    onBrowseBlocked()
+                                } else {
+                                    onBrowseArticles()
+                                }
                             } label: {
                                 Text("Browse Articles")
                                     .font(.caption.weight(.semibold))
@@ -4954,6 +4981,7 @@ private struct SavedArticleDetailView: View {
     let article: SavedArticle
     let isOffline: Bool
     let onClose: () -> Void
+    @State private var showingOfflineNavigationAlert = false
 
     var body: some View {
         Group {
@@ -4976,9 +5004,20 @@ private struct SavedArticleDetailView: View {
                 .padding()
             } else {
                 ZStack(alignment: .top) {
-                    OfflineHTMLView(htmlString: article.htmlString, baseURLString: article.urlString)
+                    OfflineHTMLView(
+                        htmlString: article.htmlString,
+                        baseURLString: article.urlString,
+                        onBlockedNavigation: {
+                            showingOfflineNavigationAlert = true
+                        }
+                    )
                 }
             }
+        }
+        .alert("No internet connection", isPresented: $showingOfflineNavigationAlert) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This link cannot be opened while you are offline.")
         }
     }
 }
@@ -4986,15 +5025,125 @@ private struct SavedArticleDetailView: View {
 private struct OfflineHTMLView: UIViewRepresentable {
     let htmlString: String
     let baseURLString: String
+    let onBlockedNavigation: () -> Void
+
+    private static let offlineChromeRemovalScript = WKUserScript(
+        source: """
+        (function() {
+            function removeOfflineChrome() {
+                var selectors = [
+                    'header',
+                    'footer',
+                    'nav',
+                    'aside',
+                    '[role="banner"]',
+                    '[role="contentinfo"]',
+                    '[id*="header" i]',
+                    '[class*="header" i]',
+                    '[id*="footer" i]',
+                    '[class*="footer" i]',
+                    '[id*="nav" i]',
+                    '[class*="nav" i]',
+                    '[id*="breadcrumb" i]',
+                    '[class*="breadcrumb" i]',
+                    '[id*="topbar" i]',
+                    '[class*="topbar" i]'
+                ];
+
+                selectors.forEach(function(selector) {
+                    document.querySelectorAll(selector).forEach(function(element) {
+                        element.remove();
+                    });
+                });
+            }
+
+            removeOfflineChrome();
+            document.addEventListener('DOMContentLoaded', removeOfflineChrome);
+            window.addEventListener('load', removeOfflineChrome);
+        })();
+        """,
+        injectionTime: .atDocumentEnd,
+        forMainFrameOnly: true
+    )
 
     func makeUIView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero)
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.addUserScript(Self.offlineChromeRemovalScript)
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = context.coordinator
         webView.loadHTMLString(htmlString, baseURL: URL(string: baseURLString))
+        context.coordinator.loadedHTMLString = htmlString
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
+        guard context.coordinator.loadedHTMLString != htmlString else { return }
+        context.coordinator.loadedHTMLString = htmlString
         uiView.loadHTMLString(htmlString, baseURL: URL(string: baseURLString))
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var parent: OfflineHTMLView
+        var loadedHTMLString: String = ""
+
+        init(_ parent: OfflineHTMLView) {
+            self.parent = parent
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let requestURL = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            if shouldAllow(requestURL: requestURL) {
+                decisionHandler(.allow)
+                return
+            }
+
+            DispatchQueue.main.async { [parent] in
+                parent.onBlockedNavigation()
+            }
+            decisionHandler(.cancel)
+        }
+
+        private func shouldAllow(requestURL: URL) -> Bool {
+            if requestURL.scheme == "about" || requestURL.isFileURL {
+                return true
+            }
+
+            guard let baseURL = URL(string: parent.baseURLString) else {
+                return false
+            }
+
+            if requestURL.absoluteString == baseURL.absoluteString {
+                return true
+            }
+
+            let requestWithoutFragment = requestURL.deletingFragment()
+            let baseWithoutFragment = baseURL.deletingFragment()
+            return requestWithoutFragment.absoluteString == baseWithoutFragment.absoluteString
+        }
+    }
+}
+
+private extension URL {
+    func deletingFragment() -> URL {
+        guard var components = URLComponents(url: self, resolvingAgainstBaseURL: false) else {
+            return self
+        }
+
+        components.fragment = nil
+        return components.url ?? self
     }
 }
 
