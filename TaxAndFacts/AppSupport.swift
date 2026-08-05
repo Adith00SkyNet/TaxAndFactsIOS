@@ -4,6 +4,7 @@ import Foundation
 import Network
 import UserNotifications
 import WebKit
+import Observation
 
 enum AppScreen {
     case home
@@ -23,7 +24,7 @@ enum AppConfiguration {
         normalizedURLString(lhs) == normalizedURLString(rhs)
     }
 
-    private static func normalizedURLString(_ url: URL) -> String {
+    static func normalizedURLString(_ url: URL) -> String {
         var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         if components?.path == "/" {
             components?.path = ""
@@ -100,7 +101,6 @@ final class NetworkStatusMonitor {
     private let monitorQueue = DispatchQueue(label: "TaxAndFacts.NetworkStatusMonitor")
 
     private(set) var isOffline = false
-    private var recoveryTask: Task<Void, Never>?
 
     init() {
         startMonitoring()
@@ -108,60 +108,28 @@ final class NetworkStatusMonitor {
 
     private func startMonitoring() {
         monitor.pathUpdateHandler = { [weak self] path in
-            let isOffline = path.status != .satisfied
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.isOffline = isOffline
-                if isOffline {
-                    self.startRecoveryChecks()
-                } else {
-                    self.recoveryTask?.cancel()
-                    self.recoveryTask = nil
-                }
+                self?.updateStatus(isOffline: path.status != .satisfied)
             }
         }
 
         monitor.start(queue: monitorQueue)
-        isOffline = monitor.currentPath.status != .satisfied
-        if isOffline {
-            startRecoveryChecks()
-        }
+        refreshStatus()
     }
 
-    private func startRecoveryChecks() {
-        guard recoveryTask == nil else { return }
-
-        recoveryTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self else { return }
-                if await self.probeConnectivity() {
-                    await MainActor.run {
-                        self.isOffline = false
-                        self.recoveryTask?.cancel()
-                        self.recoveryTask = nil
-                    }
-                    return
-                }
-            }
-        }
+    func refreshStatus() {
+        syncStatusFromPath()
     }
 
-    private func probeConnectivity() async -> Bool {
-        var request = URLRequest(
-            url: AppConfiguration.productionWebURL,
-            cachePolicy: .reloadIgnoringLocalCacheData,
-            timeoutInterval: 5
-        )
-        request.httpMethod = "HEAD"
+    private func updateStatus(isOffline: Bool) {
+        guard self.isOffline != isOffline else { return }
 
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else { return false }
-            return (200..<400).contains(httpResponse.statusCode)
-        } catch {
-            return false
-        }
+        self.isOffline = isOffline
+    }
+
+    private func syncStatusFromPath() {
+        let currentlyOffline = monitor.currentPath.status != .satisfied
+        updateStatus(isOffline: currentlyOffline)
     }
 }
 
@@ -288,10 +256,7 @@ final class ReadLaterManager {
         let patterns = [
             #"<header\b[^>]*>[\s\S]*?</header>"#,
             #"<footer\b[^>]*>[\s\S]*?</footer>"#,
-            #"<nav\b[^>]*>[\s\S]*?</nav>"#,
-            #"<aside\b[^>]*>[\s\S]*?</aside>"#,
-            #"<[^>]+\b(class|id)=\"[^\"]*(?:site-header|main-header|header|site-footer|main-footer|footer|navbar|nav|breadcrumb|topbar)[^\"]*\"[^>]*>[\s\S]*?</[^>]+>"#,
-            #"<[^>]+\b(role)=\"(?:banner|contentinfo)\"[^>]*>[\s\S]*?</[^>]+>"#
+            #"<[^>]+\b(class|id)=\"[^\"]*(?:site-header|main-header|header|site-footer|main-footer|footer)[^\"]*\"[^>]*>[\s\S]*?</[^>]+>"#
         ]
 
         for pattern in patterns {
@@ -326,6 +291,29 @@ final class ReadLaterManager {
 
     func isSaved(urlString: String) -> Bool {
         articles.contains { $0.urlString == urlString }
+    }
+
+    func savedArticle(matching urlString: String) -> SavedArticle? {
+        guard let targetURL = URL(string: urlString) else { return nil }
+        return savedArticle(matching: targetURL)
+    }
+
+    func savedArticle(matching targetURL: URL) -> SavedArticle? {
+        let normalizedTargetURLString = AppConfiguration.normalizedURLString(targetURL)
+
+        return articles.first { article in
+            guard let articleURL = URL(string: article.urlString) else { return false }
+            return AppConfiguration.normalizedURLString(articleURL) == normalizedTargetURLString
+        }
+    }
+
+    func normalizedSavedArticleURLStrings() -> [String] {
+        let normalizedStrings = articles.compactMap { article -> String? in
+            guard let url = URL(string: article.urlString) else { return nil }
+            return AppConfiguration.normalizedURLString(url)
+        }
+
+        return Array(Set(normalizedStrings)).sorted()
     }
 
     func setArticle(_ article: SavedArticle, isRead: Bool) {

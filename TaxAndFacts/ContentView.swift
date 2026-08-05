@@ -8,6 +8,7 @@ import PhotosUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var readLaterManager = ReadLaterManager()
     @State private var networkStatusMonitor = NetworkStatusMonitor()
     @State private var selectedScreen: AppScreen = .home
@@ -67,6 +68,9 @@ struct ContentView: View {
                         SavedArticleDetailView(
                             article: selectedSavedArticle,
                             isOffline: isOffline,
+                            savedArticleURLStrings: readLaterManager.normalizedSavedArticleURLStrings(),
+                            onOpenSavedLink: openOfflineSavedLink,
+                            onBlockedNavigation: showNoInternetAlert,
                             onClose: {
                                 self.selectedSavedArticle = nil
                                 self.selectedScreen = .saved
@@ -86,11 +90,6 @@ struct ContentView: View {
                 onSaved: showSaved
             )
         }
-        .onChange(of: isOffline) { _, newValue in
-            if newValue {
-                selectedScreen = .saved
-            }
-        }
         .onChange(of: networkStatusMonitor.isOffline) { _, newValue in
             if newValue {
                 selectedScreen = .saved
@@ -100,6 +99,11 @@ struct ContentView: View {
                 webURL = AppConfiguration.productionWebURL
                 webHistory.removeAll()
                 canGoBack = false
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                networkStatusMonitor.refreshStatus()
             }
         }
         .alert("No internet connection", isPresented: $showingNoInternetAlert) {
@@ -167,6 +171,16 @@ struct ContentView: View {
 
     private func showNoInternetAlert() {
         showingNoInternetAlert = true
+    }
+
+    private func openOfflineSavedLink(_ urlString: String) {
+        guard let targetArticle = readLaterManager.savedArticle(matching: urlString) else {
+            showNoInternetAlert()
+            return
+        }
+
+        selectedSavedArticle = targetArticle
+        selectedScreen = .savedArticle
     }
 
     private func openSavedArticle(_ article: SavedArticle) {
@@ -297,6 +311,7 @@ private struct HomeTabContainer: View {
     @State private var isCalculatorStep4 = false
     @State private var uploadSuccessState: UploadSuccessState?
     @State private var captureAlert: CalculatorCaptureAlert?
+    @State private var duplicateDocumentAlert: CalculatorCaptureAlert?
     @State private var unclearImageAlert: CalculatorCaptureAlert?
     @State private var documentNotRecognizedAlert: CalculatorCaptureAlert?
     @State private var lastW2ScanSource: W2ScanSource = .camera
@@ -474,8 +489,7 @@ private struct HomeTabContainer: View {
                 return Alert(
                     title: Text(alert.title),
                     message: Text(alert.message),
-                    primaryButton: .default(Text("Upload again"), action: reopenLastScanSource),
-                    secondaryButton: .cancel(Text("Cancel"))
+                    dismissButton: .cancel(Text("Cancel"))
                 )
             case .cameraAccessDenied:
                 return Alert(
@@ -628,6 +642,41 @@ private struct HomeTabContainer: View {
                 alertController.addAction(UIAlertAction(title: "Enter manually", style: .default) { _ in
                     dismiss()
                     enterW2Manually()
+                })
+
+                alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
+                    dismiss()
+                })
+
+                return alertController
+            }
+        )
+        .background(
+            NativeCenteredAlertPresenter(isPresented: Binding(
+                get: { duplicateDocumentAlert != nil },
+                set: { newValue in
+                    if !newValue {
+                        duplicateDocumentAlert = nil
+                    }
+                }
+            )) { dismiss in
+                let alert = duplicateDocumentAlert ?? CalculatorCaptureAlert(
+                    title: "Duplicate document",
+                    message: "This W-2 appears to match one you have already uploaded. Please upload a different W-2.",
+                    kind: .duplicateDocument
+                )
+
+                let alertController = UIAlertController(
+                    title: alert.title,
+                    message: alert.message,
+                    preferredStyle: .alert
+                )
+
+                alertController.addAction(UIAlertAction(title: "Upload again", style: .default) { _ in
+                    dismiss()
+                    DispatchQueue.main.async {
+                        reopenLastScanSource()
+                    }
                 })
 
                 alertController.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in
@@ -1058,7 +1107,7 @@ private struct HomeTabContainer: View {
                     }
                 } else if extractedFields.hasAnyValue {
                     if isDuplicateW2Document(extractedFields) {
-                        captureAlert = CalculatorCaptureAlert(
+                        duplicateDocumentAlert = CalculatorCaptureAlert(
                             title: "Duplicate document",
                             message: "This W-2 appears to match one you have already uploaded. Please upload a different W-2.",
                             kind: .duplicateDocument
@@ -1308,14 +1357,23 @@ private struct HomeTabContainer: View {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            parent.isOffline = false
-            parent.currentTitle = cleanTitle(webView.title)
-            parent.currentURLString = webView.url?.absoluteString ?? ""
-            parent.canGoBack = webView.canGoBack
+            let currentURL = webView.url
+            let currentTitle = cleanTitle(webView.title)
+            let canGoBack = webView.canGoBack
 
-            if let currentURL = webView.url {
-                loadedURL = currentURL
-                parent.onNavigationFinished(currentURL, webView.canGoBack)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.parent.isOffline {
+                    self.parent.isOffline = false
+                }
+                self.parent.currentTitle = currentTitle
+                self.parent.currentURLString = currentURL?.absoluteString ?? ""
+                self.parent.canGoBack = canGoBack
+
+                if let currentURL {
+                    self.loadedURL = currentURL
+                    self.parent.onNavigationFinished(currentURL, canGoBack)
+                }
             }
 
             updateCurrentPageTitle(from: webView)
@@ -1331,9 +1389,12 @@ private struct HomeTabContainer: View {
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            parent.canGoBack = webView.canGoBack
-            parent.isCalculatorStep2 = false
-            parent.isCalculatorStep4 = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.parent.canGoBack = webView.canGoBack
+                self.parent.isCalculatorStep2 = false
+                self.parent.isCalculatorStep4 = false
+            }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -1394,7 +1455,9 @@ private struct HomeTabContainer: View {
             ]
 
             if offlineCodes.contains(nsError.code) {
-                parent.isOffline = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.isOffline = true
+                }
             }
         }
 
@@ -1454,14 +1517,18 @@ private struct HomeTabContainer: View {
 
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 guard let self, let imageURLString = result as? String else { return }
-                self.parent.currentImageURLString = imageURLString
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.currentImageURLString = imageURLString
+                }
             }
         }
 
         private func updateCalculatorStepState(in webView: WKWebView) {
             let currentURLString = webView.url?.absoluteString ?? ""
             guard AppConfiguration.isCalculatorURL(currentURLString) else {
-                parent.isCalculatorStep2 = false
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.isCalculatorStep2 = false
+                }
                 return
             }
 
@@ -1626,7 +1693,9 @@ private struct HomeTabContainer: View {
         func updateCalculatorResultState(in webView: WKWebView) {
             let currentURLString = webView.url?.absoluteString ?? ""
             guard AppConfiguration.isCalculatorURL(currentURLString) else {
-                parent.isCalculatorStep4 = false
+                DispatchQueue.main.async { [weak self] in
+                    self?.parent.isCalculatorStep4 = false
+                }
                 return
             }
 
@@ -4980,8 +5049,10 @@ private enum W2FieldExtractor {
 private struct SavedArticleDetailView: View {
     let article: SavedArticle
     let isOffline: Bool
+    let savedArticleURLStrings: [String]
+    let onOpenSavedLink: (String) -> Void
+    let onBlockedNavigation: () -> Void
     let onClose: () -> Void
-    @State private var showingOfflineNavigationAlert = false
 
     var body: some View {
         Group {
@@ -5007,17 +5078,12 @@ private struct SavedArticleDetailView: View {
                     OfflineHTMLView(
                         htmlString: article.htmlString,
                         baseURLString: article.urlString,
-                        onBlockedNavigation: {
-                            showingOfflineNavigationAlert = true
-                        }
+                        savedArticleURLStrings: savedArticleURLStrings,
+                        onOpenSavedLink: onOpenSavedLink,
+                        onBlockedNavigation: onBlockedNavigation
                     )
                 }
             }
-        }
-        .alert("No internet connection", isPresented: $showingOfflineNavigationAlert) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text("This link cannot be opened while you are offline.")
         }
     }
 }
@@ -5025,29 +5091,32 @@ private struct SavedArticleDetailView: View {
 private struct OfflineHTMLView: UIViewRepresentable {
     let htmlString: String
     let baseURLString: String
+    let savedArticleURLStrings: [String]
+    let onOpenSavedLink: (String) -> Void
     let onBlockedNavigation: () -> Void
 
     private static let offlineChromeRemovalScript = WKUserScript(
         source: """
         (function() {
+            if (window.__taxFactsOfflineLinkScriptInstalled) {
+                return;
+            }
+
+            window.__taxFactsOfflineLinkScriptInstalled = true;
+            window.__taxFactsOfflineSavedURLs = [];
+
             function removeOfflineChrome() {
+                if (!document.body) {
+                    return;
+                }
+
                 var selectors = [
                     'header',
                     'footer',
-                    'nav',
-                    'aside',
-                    '[role="banner"]',
-                    '[role="contentinfo"]',
                     '[id*="header" i]',
                     '[class*="header" i]',
                     '[id*="footer" i]',
-                    '[class*="footer" i]',
-                    '[id*="nav" i]',
-                    '[class*="nav" i]',
-                    '[id*="breadcrumb" i]',
-                    '[class*="breadcrumb" i]',
-                    '[id*="topbar" i]',
-                    '[class*="topbar" i]'
+                    '[class*="footer" i]'
                 ];
 
                 selectors.forEach(function(selector) {
@@ -5057,9 +5126,192 @@ private struct OfflineHTMLView: UIViewRepresentable {
                 });
             }
 
-            removeOfflineChrome();
-            document.addEventListener('DOMContentLoaded', removeOfflineChrome);
-            window.addEventListener('load', removeOfflineChrome);
+            function revealReadMoreSections() {
+                if (!document.body) {
+                    return;
+                }
+
+                var selectors = [
+                    '[id*="read-more" i]',
+                    '[class*="read-more" i]',
+                    '[id*="readmore" i]',
+                    '[class*="readmore" i]',
+                    '[data-read-more]',
+                    '[aria-controls*="read-more" i]',
+                    '[aria-expanded="false"]'
+                ];
+
+                selectors.forEach(function(selector) {
+                    document.querySelectorAll(selector).forEach(function(element) {
+                        element.hidden = false;
+                        element.style.removeProperty('display');
+                        element.style.removeProperty('visibility');
+                        element.style.removeProperty('max-height');
+                        element.style.removeProperty('overflow');
+                        element.style.removeProperty('-webkit-line-clamp');
+                        element.style.removeProperty('WebkitLineClamp');
+                    });
+                });
+
+                var toggleButton = document.getElementById('toggleBtn');
+                if (!toggleButton) {
+                    var buttons = document.querySelectorAll('button, a');
+                    for (var i = 0; i < buttons.length; i++) {
+                        var candidate = buttons[i];
+                        if (/read more/i.test((candidate.textContent || '').trim())) {
+                            toggleButton = candidate;
+                            break;
+                        }
+                    }
+                }
+
+                if (toggleButton) {
+                    toggleButton.hidden = false;
+                    toggleButton.style.removeProperty('display');
+                    toggleButton.style.removeProperty('visibility');
+                }
+            }
+
+            function applyReadMoreState() {
+                var article = document.getElementById('readArticle');
+                var button = document.getElementById('toggleBtn');
+                var toc = document.getElementById('toc');
+
+                if (!article || !button || !toc) {
+                    return;
+                }
+
+                var isExpanded = article.classList.contains('expanded');
+                button.textContent = isExpanded ? 'Read Less' : 'Read More';
+                toc.style.display = isExpanded ? 'block' : 'none';
+            }
+
+            function toggleReadMore() {
+                var container = document.getElementById('right-container');
+                var elements = container ? container.querySelectorAll('.order-3, .order-4') : [];
+
+                var article = document.getElementById('readArticle');
+                var button = document.getElementById('toggleBtn');
+                var toc = document.getElementById('toc');
+                if (!article || !button || !toc) {
+                    return;
+                }
+
+                article.classList.toggle('expanded');
+
+                if (article.classList.contains('expanded')) {
+                    button.textContent = 'Read Less';
+                    toc.style.display = 'block';
+                } else {
+                    button.textContent = 'Read More';
+                    toc.style.display = 'none';
+                }
+
+                elements.forEach(function(el) {
+                    if (el.classList.contains('order-3')) {
+                        el.classList.replace('order-3', 'order-4');
+                    } else if (el.classList.contains('order-4')) {
+                        el.classList.replace('order-4', 'order-3');
+                    }
+                });
+            }
+
+            function normalizeUrlString(value) {
+                try {
+                    var url = new URL(value, document.baseURI);
+                    url.hash = '';
+                    if (url.pathname === '/') {
+                        url.pathname = '';
+                    }
+                    return url.href;
+                } catch (error) {
+                    return '';
+                }
+            }
+
+            function isTaxAndFactsHost(host) {
+                host = (host || '').toLowerCase();
+                return host === 'taxandfacts.com' || host.endsWith('.taxandfacts.com');
+            }
+
+            function isSavedUrl(normalizedUrl) {
+                return window.__taxFactsOfflineSavedURLs.indexOf(normalizedUrl) !== -1;
+            }
+
+            function classifyLink(anchor) {
+                var href = anchor.getAttribute('href');
+                if (!href) {
+                    return;
+                }
+
+                var resolved = normalizeUrlString(href);
+                if (!resolved) {
+                    return;
+                }
+
+                var url;
+                try {
+                    url = new URL(resolved);
+                } catch (error) {
+                    return;
+                }
+
+                var isLocal = false;
+                if (url.protocol === 'http:' || url.protocol === 'https:') {
+                    isLocal = isTaxAndFactsHost(url.hostname) && isSavedUrl(resolved);
+                }
+
+                anchor.classList.toggle('offline-disabled-link', !isLocal);
+                anchor.dataset.taxfactsOfflineLinkState = isLocal ? 'local' : 'blocked';
+                anchor.dataset.taxfactsOfflineTarget = resolved;
+
+                if (!anchor.dataset.taxfactsOfflineListenerAttached) {
+                    anchor.dataset.taxfactsOfflineListenerAttached = '1';
+                    anchor.addEventListener('click', function(event) {
+                        var state = anchor.dataset.taxfactsOfflineLinkState || 'blocked';
+                        var target = anchor.dataset.taxfactsOfflineTarget || resolved;
+
+                        event.preventDefault();
+                        event.stopPropagation();
+
+                        window.webkit.messageHandlers.taxfactsOfflineLink.postMessage({
+                            action: state === 'local' ? 'open' : 'blocked',
+                            url: target
+                        });
+                    }, true);
+                }
+            }
+
+            function refreshOfflineLinks() {
+                if (!document.body) {
+                    return;
+                }
+
+                removeOfflineChrome();
+                revealReadMoreSections();
+                applyReadMoreState();
+                window.toggleReadMore = toggleReadMore;
+                document.body.querySelectorAll('a[href]').forEach(function(anchor) {
+                    classifyLink(anchor);
+                });
+            }
+
+            window.__taxFactsSetOfflineSavedURLs = function(urls) {
+                window.__taxFactsOfflineSavedURLs = Array.isArray(urls) ? urls.slice() : [];
+                refreshOfflineLinks();
+            };
+
+            var style = document.getElementById('taxfacts-offline-link-style');
+            if (!style) {
+                style = document.createElement('style');
+                style.id = 'taxfacts-offline-link-style';
+                style.textContent = '.offline-disabled-link { color: #9ca3af !important; text-decoration: none !important; }';
+                document.head.appendChild(style);
+            }
+
+            refreshOfflineLinks();
+            document.addEventListener('DOMContentLoaded', refreshOfflineLinks);
+            window.addEventListener('load', refreshOfflineLinks);
         })();
         """,
         injectionTime: .atDocumentEnd,
@@ -5069,15 +5321,24 @@ private struct OfflineHTMLView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController.addUserScript(Self.offlineChromeRemovalScript)
+        configuration.userContentController.add(context.coordinator, name: Coordinator.offlineLinkMessageName)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.loadHTMLString(htmlString, baseURL: URL(string: baseURLString))
         context.coordinator.loadedHTMLString = htmlString
+        context.coordinator.pendingSavedArticleURLStrings = savedArticleURLStrings
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
+        let signature = savedArticleURLStrings.joined(separator: "\u{1f}")
+        if context.coordinator.savedArticleURLsSignature != signature {
+            context.coordinator.savedArticleURLsSignature = signature
+            context.coordinator.pendingSavedArticleURLStrings = savedArticleURLStrings
+            context.coordinator.applySavedArticleURLsIfNeeded(into: uiView)
+        }
+
         guard context.coordinator.loadedHTMLString != htmlString else { return }
         context.coordinator.loadedHTMLString = htmlString
         uiView.loadHTMLString(htmlString, baseURL: URL(string: baseURLString))
@@ -5087,12 +5348,29 @@ private struct OfflineHTMLView: UIViewRepresentable {
         Coordinator(self)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        static let offlineLinkMessageName = "taxfactsOfflineLink"
         var parent: OfflineHTMLView
         var loadedHTMLString: String = ""
+        var pendingSavedArticleURLStrings: [String] = []
+        var savedArticleURLsSignature: String = ""
 
         init(_ parent: OfflineHTMLView) {
             self.parent = parent
+        }
+
+        func applySavedArticleURLsIfNeeded(into webView: WKWebView) {
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: pendingSavedArticleURLStrings, options: []),
+                  let jsonString = String(data: jsonData, encoding: .utf8) else {
+                return
+            }
+
+            let script = "window.__taxFactsSetOfflineSavedURLs(\(jsonString));"
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            applySavedArticleURLsIfNeeded(into: webView)
         }
 
         func webView(
@@ -5114,6 +5392,24 @@ private struct OfflineHTMLView: UIViewRepresentable {
                 parent.onBlockedNavigation()
             }
             decisionHandler(.cancel)
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == Self.offlineLinkMessageName,
+                  let payload = message.body as? [String: Any],
+                  let action = payload["action"] as? String,
+                  let urlString = payload["url"] as? String else {
+                return
+            }
+
+            DispatchQueue.main.async { [parent] in
+                switch action {
+                case "open":
+                    parent.onOpenSavedLink(urlString)
+                default:
+                    parent.onBlockedNavigation()
+                }
+            }
         }
 
         private func shouldAllow(requestURL: URL) -> Bool {
